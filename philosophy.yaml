@@ -1,0 +1,114 @@
+# Francis-Hayes Trading Bot — Philosophy Configuration
+# Encoded from Hayes' recording at Anchorage Inn & Marina
+# Strategy: Monthly Call Buying — Weekly Execution When Conditions Are Right
+
+# ─────────────────────────────────────────────
+# CHART & TREND RULES
+# "The monthly chart dictates direction and trend"
+# "Daily is too easy to be hit fake"
+# ─────────────────────────────────────────────
+trend:
+  primary_timeframe: monthly        # Monthly is the boss
+  confirmation_timeframe: weekly    # Weekly must agree
+  ignore_timeframe: daily           # Too noisy, never trade off daily
+  buying_windows:                   # "Most buying occurs Friday PM and Monday AM"
+    - friday_afternoon              # Friday 2pm-4pm ET
+    - monday_morning                # Monday 9:30am-11am ET
+
+# ─────────────────────────────────────────────
+# STOCK CLASSIFICATION
+# "Are you buying growth or income?"
+# ─────────────────────────────────────────────
+stock_types:
+  growth:
+    primary_metric: CAGR            # Compounded Annual Growth Rate — #1 metric
+    red_flag: revenue_deceleration  # "Paid for 20%, got 10% — very hard to compound"
+    revenue_over_earnings: true     # "You can't lie about revenue"
+    acceptable_beta: ">1.0"         # Higher volatility OK for growth
+
+  income:
+    primary_metric: dividend_yield_vs_treasury
+    minimum_yield_above_treasury: true  # "Otherwise just buy treasuries"
+    red_flag: yield_below_10yr_treasury
+    preferred_beta: "<1.0"          # Lower volatility preferred
+    covered_call_overlay: optional  # e.g. 3% dividend + calls = 7% total yield
+
+# ─────────────────────────────────────────────
+# FUNDAMENTAL FILTERS
+# "What's the earnings power? Is revenue growing or decelerating?"
+# ─────────────────────────────────────────────
+fundamentals:
+  revenue_growth_must_be_positive: true
+  revenue_deceleration_max_pct: 50    # Revenue growth can't drop by more than half YoY
+  earnings_power_positive: true
+  familiarity_required: true          # "If you're not familiar with the company — don't touch it"
+
+# ─────────────────────────────────────────────
+# OPTIONS MARKET SENTIMENT
+# "Put to call — are more people buying calls or puts?"
+# "Look 6-12 months out, not daily — daily means nothing"
+# ─────────────────────────────────────────────
+options_sentiment:
+  lookout_window_months_min: 6
+  lookout_window_months_max: 12
+  put_call_bullish_threshold: 1.0     # Calls must outweigh puts (>1.0 = more calls)
+  strong_bullish_threshold: 2.0       # 2:1 calls to puts = "very bullish"
+
+# ─────────────────────────────────────────────
+# VOLUME
+# "Volume predicts price — the more volume, the more price"
+# ─────────────────────────────────────────────
+volume:
+  trend_must_be_positive: true        # Rising volume confirms rising price
+  use_for_confirmation: true
+
+# ─────────────────────────────────────────────
+# STRIKE SELECTION
+# "No more than 10% OTM"
+# "Can write ATM if S&P trend is downward"
+# ─────────────────────────────────────────────
+strike_selection:
+  max_otm_percent: 10                 # Never buy more than 10% out of the money
+  default_target_otm_percent: 5       # Sweet spot — balance of cost and leverage
+  atm_condition: sp500_monthly_downtrend   # Go ATM when market is heading down
+  expiry_dte_min: 28                  # Minimum days to expiry
+  expiry_dte_max: 35                  # Maximum days to expiry ("a month out")
+
+# ─────────────────────────────────────────────
+# RISK MANAGEMENT
+# ─────────────────────────────────────────────
+risk:
+  # Position sizing
+  max_position_size_pct: 5.0          # Never more than 5% of portfolio per name
+  max_positions: 20                   # Hard cap — 20 names tops
+  target_positions: 10                # Sweet spot for active management
+
+  # Exit rules
+  stop_loss_underlying_pct: 10.0      # Exit call if STOCK drops 10% from entry
+                                      # (watch underlying price, not option premium)
+
+  # Time horizon
+  thesis_horizon_months: 12           # "Typically it's gonna be a year"
+
+# ─────────────────────────────────────────────
+# RISK-FREE RATE BENCHMARK
+# "All returns are based on the 10-year treasury"
+# "You have to get above whatever the risk-free rate is"
+# ─────────────────────────────────────────────
+benchmark:
+  risk_free_instrument: 10yr_treasury
+  income_stock_min_yield_premium: 0   # Yield must beat treasury — period
+  fetch_live_treasury_rate: true      # Pull current rate dynamically
+
+# ─────────────────────────────────────────────
+# SCORING WEIGHTS
+# Higher weight = more important to Hayes
+# ─────────────────────────────────────────────
+scoring_weights:
+  monthly_trend_strength: 0.25        # Most important — monthly dictates direction
+  revenue_growth_cagr: 0.20           # #1 fundamental metric
+  put_call_ratio_skew: 0.15           # Smart money sentiment 6-12mo out
+  volume_trend: 0.15                  # Volume predicts price
+  beta_fit: 0.10                      # Volatility appropriate for strategy
+  yield_vs_risk_free: 0.10            # Income stocks: must beat treasury
+  weekly_trend_confirmation: 0.05     # Secondary — confirms monthly only

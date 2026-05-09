@@ -1,0 +1,255 @@
+"""
+weekly_scanner.py
+Runs every Sunday evening / Monday pre-market.
+Scans a universe of stocks, scores them against Hayes' philosophy,
+and produces a ranked shortlist report for human review before execution.
+
+'Most buying occurs Friday afternoons and Monday mornings.'
+"""
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Default universe — expand as you learn more names
+# Hayes: 'If you're not familiar with the company, don't touch it'
+# Start with names you know, add gradually
+DEFAULT_UNIVERSE = [
+    # Large cap growth
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA",
+    # Quality growth
+    "CRM", "NOW", "SNOW", "DDOG", "CRWD", "NET",
+    # Income / dividend growth
+    "KO", "JNJ", "PG", "V", "MA", "BRK.B",
+    # Add your own as Hayes identifies them
+]
+
+
+@dataclass
+class ScanResult:
+    symbol: str
+    score: float
+    approved: bool
+    stock_type: str
+    monthly_trend: str
+    weekly_confirms: bool
+    put_call_sentiment: str
+    put_call_ratio: float
+    volume_trend: str
+    recommended_strike: Optional[float]
+    recommended_expiry: Optional[str]
+    strike_type: Optional[str]
+    otm_pct: Optional[float]
+    contracts: Optional[int]
+    estimated_cost: Optional[float]     # Total cost in USD
+    failed_rules: list[str]
+    score_breakdown: dict
+    company_brief: str                  # For unfamiliar names
+
+
+class WeeklyScanner:
+    """
+    The discovery engine — finds names Hayes might not be watching.
+    Produces a ranked report for human review before any trade is placed.
+    """
+
+    def __init__(self, alpaca_client, market_analyzer, options_analyzer,
+                 hard_rules, scorer, fundamentals_fetcher, philosophy):
+        self.client = alpaca_client
+        self.market = market_analyzer
+        self.options = options_analyzer
+        self.rules = hard_rules
+        self.scorer = scorer
+        self.fundamentals = fundamentals_fetcher
+        self.phil = philosophy
+
+    def run(self, universe: list[str] = None) -> list[ScanResult]:
+        """
+        Scans the universe, returns ranked list of candidates.
+        Only approved trades (passed rules + score >= 60%) appear at top.
+        """
+        if universe is None:
+            universe = DEFAULT_UNIVERSE
+
+        # Check portfolio state
+        portfolio_value = self.client.get_portfolio_value()
+        open_positions = self.client.get_open_option_positions()
+        max_positions = self.phil["risk"]["max_positions"]
+        max_reached = len(open_positions) >= max_positions
+        open_symbols = {p.symbol for p in open_positions}
+
+        # Get market context once — used for all symbols
+        sp500_trend = self.market.get_sp500_trend()
+        treasury_rate = self.fundamentals.get_treasury_rate()
+
+        results = []
+        logger.info(f"Scanning {len(universe)} symbols... S&P trend: {sp500_trend}")
+
+        for symbol in universe:
+            # Skip if already in portfolio
+            if symbol in open_symbols:
+                logger.info(f"{symbol}: Already in portfolio, skipping")
+                continue
+
+            try:
+                result = self._scan_symbol(
+                    symbol=symbol,
+                    sp500_trend=sp500_trend,
+                    portfolio_value=portfolio_value,
+                    treasury_rate=treasury_rate,
+                    max_positions_reached=max_reached,
+                )
+                if result:
+                    results.append(result)
+
+            except Exception as e:
+                logger.error(f"Error scanning {symbol}: {e}")
+                continue
+
+        # Sort: approved first, then by score descending
+        results.sort(key=lambda r: (not r.approved, -r.score))
+
+        self._print_report(results, sp500_trend, portfolio_value, open_positions)
+        return results
+
+    def _scan_symbol(
+        self,
+        symbol: str,
+        sp500_trend: str,
+        portfolio_value: float,
+        treasury_rate: float,
+        max_positions_reached: bool,
+    ) -> Optional[ScanResult]:
+
+        # 1. Trend analysis
+        trend = self.market.analyze(symbol)
+
+        # 2. Fundamentals
+        fund = self.fundamentals.get(symbol)
+        if not fund:
+            return None
+
+        # 3. Options analysis
+        opts = self.options.analyze(
+            symbol=symbol,
+            current_price=trend.current_price,
+            sp500_trend=sp500_trend,
+            portfolio_value=portfolio_value,
+        )
+
+        # 4. Hard rules check
+        rules_result = self.rules.check(
+            symbol=symbol,
+            monthly_trend=trend.monthly_trend,
+            weekly_trend=trend.weekly_trend,
+            weekly_confirms_monthly=trend.weekly_confirms_monthly,
+            breaking_support=trend.breaking_support,
+            revenue_growth_pct=fund.revenue_growth_yoy,
+            revenue_accelerating=fund.revenue_accelerating,
+            put_call_sentiment=opts.sentiment if opts else "neutral",
+            max_positions_reached=max_positions_reached,
+        )
+
+        # 5. Score (even if rules failed — for transparency in report)
+        score_result = self.scorer.score(
+            symbol=symbol,
+            monthly_trend_strength=trend.monthly_trend_strength,
+            weekly_confirms_monthly=trend.weekly_confirms_monthly,
+            revenue_cagr_pct=fund.revenue_cagr,
+            revenue_growth_yoy=fund.revenue_growth_yoy,
+            stock_type=fund.stock_type,
+            dividend_yield=fund.dividend_yield,
+            treasury_rate=treasury_rate,
+            beta=fund.beta,
+            put_call_sentiment_score=opts.sentiment_score if opts else 0.3,
+            volume_trend_score=trend.volume_trend_score,
+        )
+
+        # Estimated total cost
+        estimated_cost = None
+        if opts and opts.estimated_premium and opts.contracts_affordable:
+            estimated_cost = opts.estimated_premium * 100 * opts.contracts_affordable
+
+        return ScanResult(
+            symbol=symbol,
+            score=score_result.total_score,
+            approved=rules_result.passed and score_result.approved,
+            stock_type=fund.stock_type,
+            monthly_trend=trend.monthly_trend,
+            weekly_confirms=trend.weekly_confirms_monthly,
+            put_call_sentiment=opts.sentiment if opts else "unknown",
+            put_call_ratio=opts.put_call_ratio if opts else 0.0,
+            volume_trend=trend.volume_trend,
+            recommended_strike=opts.recommended_strike if opts else None,
+            recommended_expiry=opts.recommended_expiry if opts else None,
+            strike_type=opts.strike_type if opts else None,
+            otm_pct=opts.otm_percent if opts else None,
+            contracts=opts.contracts_affordable if opts else None,
+            estimated_cost=estimated_cost,
+            failed_rules=rules_result.failed_rules,
+            score_breakdown=score_result.component_scores,
+            company_brief=fund.brief,
+        )
+
+    def _print_report(
+        self,
+        results: list[ScanResult],
+        sp500_trend: str,
+        portfolio_value: float,
+        open_positions: list,
+    ):
+        """Prints the weekly report for Hayes and team to review."""
+        now = datetime.now().strftime("%A %B %d, %Y %I:%M %p")
+        approved = [r for r in results if r.approved]
+        watchlist = [r for r in results if not r.approved]
+
+        print("\n" + "=" * 65)
+        print(f"  FRANCIS-HAYES TRADING BOT — WEEKLY SCAN REPORT")
+        print(f"  {now}")
+        print("=" * 65)
+        print(f"  S&P 500 Trend:    {sp500_trend.upper()}")
+        print(f"  Portfolio Value:  ${portfolio_value:,.0f}")
+        print(f"  Open Positions:   {len(open_positions)} / 20")
+        print(f"  Symbols Scanned:  {len(results)}")
+        print(f"  Approved Trades:  {len(approved)}")
+        print("=" * 65)
+
+        if approved:
+            print(f"\n  ✅ APPROVED FOR REVIEW ({len(approved)} names)")
+            print("  " + "-" * 60)
+            for r in approved:
+                cost_str = f"~${r.estimated_cost:,.0f}" if r.estimated_cost else "unknown cost"
+                print(
+                    f"\n  {r.symbol} [{r.stock_type.upper()}]  "
+                    f"Score: {r.score:.0%}"
+                )
+                print(f"  {r.company_brief}")
+                print(
+                    f"  Strike: {r.strike_type} ${r.recommended_strike:.2f} "
+                    f"({r.otm_pct:.1f}% OTM)  |  Expiry: {r.recommended_expiry}"
+                )
+                print(
+                    f"  Contracts: {r.contracts}  |  Est. Cost: {cost_str}"
+                )
+                print(
+                    f"  Put/Call: {r.put_call_ratio:.1f}x ({r.put_call_sentiment})  |  "
+                    f"Volume: {r.volume_trend}  |  "
+                    f"Monthly: {r.monthly_trend} {'✓' if r.weekly_confirms else '~'}"
+                )
+
+        if watchlist:
+            print(f"\n\n  👀 WATCHLIST — Conditions Not Yet Met ({len(watchlist)} names)")
+            print("  " + "-" * 60)
+            for r in watchlist[:5]:    # Show top 5 near-misses only
+                print(
+                    f"  {r.symbol:6s}  Score: {r.score:.0%}  "
+                    f"Failed: {', '.join(r.failed_rules[:2])}"
+                )
+
+        print("\n" + "=" * 65)
+        print("  ⚠️  REMINDER: Review each approved name before executing.")
+        print("  Hayes: 'If you're not familiar with the company — don't touch it.'")
+        print("=" * 65 + "\n")
