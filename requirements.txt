@@ -1,0 +1,16 @@
+# Francis-Hayes Trading Bot — Dependencies
+
+# Alpaca Markets API
+alpaca-py>=0.18.0
+
+# Data & analysis
+pandas>=2.0.0
+numpy>=1.24.0
+yfinance>=0.2.40          # Fundamentals, treasury rate — no API key needed
+
+# TradingView screener — universe discovery, no API key needed
+tradingview-screener>=3.0.0
+
+# Config & utilities
+pyyaml>=6.0
+requests>=2.31.0

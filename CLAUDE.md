@@ -38,8 +38,14 @@ trading_bot/
 ├── execution/
 │   └── alpaca_client.py       # Alpaca API wrapper (paper/live toggle)
 └── scanner/
+    ├── universe.py            # TradingView screener — dynamic universe
     └── weekly_scanner.py      # Sunday/Monday scan + ranked report
 ```
+
+## Data Sources (no API keys needed)
+- **yfinance** — revenue CAGR, beta, dividend yield, treasury rate
+- **tradingview-screener** — dynamic universe discovery each week
+- **Alpaca** — price bars, options chain, execution
 
 ## What's Not Built Yet (next priorities)
 1. `execution/execute` command in bot.py — submit approved trades after human review
