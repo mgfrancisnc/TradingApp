@@ -14,7 +14,7 @@ Uses stdlib smtplib — no extra dependencies.
 
 Gmail setup (recommended):
   1. Enable 2-factor authentication on your Gmail account
-  2. Google Account → Security → App Passwords → create one for "Mail"
+  2. Google Account → Security → App Passwords → create one named "mgfbot"
   3. Set ALERT_SMTP_PASSWORD to the 16-character app password (not your login password)
 
 Required environment variables:
@@ -82,7 +82,7 @@ class EmailNotifier:
         total_income = sum(r.premium_total or 0 for r in approved)
 
         subject = (
-            f"[Hayes Bot] Weekly Scan — {len(approved)} trade(s) approved"
+            f"[mgfbot] Weekly Scan — {len(approved)} trade(s) approved"
         )
 
         lines = [
@@ -162,7 +162,7 @@ class EmailNotifier:
         t = alert.alert_type
 
         if t == "CIRCUIT_BREAKER":
-            subject = "[Hayes Bot] CIRCUIT BREAKER — New trades halted"
+            subject = "[mgfbot] CIRCUIT BREAKER — New trades halted"
             body = "\n".join([
                 alert.message,
                 "",
@@ -173,7 +173,7 @@ class EmailNotifier:
             ])
 
         elif t == "ITM_WARNING":
-            subject = f"[Hayes Bot] ITM WARNING — {alert.symbol} above strike, {alert.dte} DTE"
+            subject = f"[mgfbot] ITM WARNING — {alert.symbol} above strike, {alert.dte} DTE"
             lines = [alert.message, ""]
             if alert.current_stock_price and alert.strike:
                 lines += [
@@ -189,7 +189,7 @@ class EmailNotifier:
             body = "\n".join(lines)
 
         elif t == "EXPIRING_SOON":
-            subject = f"[Hayes Bot] Expiring soon — {alert.symbol} ({alert.dte} DTE)"
+            subject = f"[mgfbot] Expiring soon — {alert.symbol} ({alert.dte} DTE)"
             lines = [alert.message, ""]
             if alert.current_stock_price and alert.strike:
                 itm = alert.current_stock_price >= alert.strike
@@ -203,7 +203,7 @@ class EmailNotifier:
             body = "\n".join(lines)
 
         elif t == "ASSIGNED":
-            subject = f"[Hayes Bot] ASSIGNED — {alert.symbol} shares called away"
+            subject = f"[mgfbot] ASSIGNED — {alert.symbol} shares called away"
             body = "\n".join([
                 alert.message,
                 "",
@@ -214,7 +214,7 @@ class EmailNotifier:
             ])
 
         elif t == "EXPIRED_WORTHLESS":
-            subject = f"[Hayes Bot] Expired worthless — {alert.symbol}"
+            subject = f"[mgfbot] Expired worthless — {alert.symbol}"
             body = "\n".join([
                 alert.message,
                 "",
@@ -225,7 +225,7 @@ class EmailNotifier:
             ])
 
         else:
-            subject = f"[Hayes Bot] {t} — {alert.symbol}"
+            subject = f"[mgfbot] {t} — {alert.symbol}"
             body = alert.message
 
         return subject, body
