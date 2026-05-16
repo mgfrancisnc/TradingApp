@@ -40,6 +40,8 @@ class FundamentalData:
     industry: Optional[str]
     market_cap: Optional[float]
     brief: str
+    familiarity_confirmed: bool = True  # Hayes: 'if you don't know it, don't touch it'
+    earnings_in_window: bool = False    # True if earnings fall within option expiry window
 
 
 class FundamentalsFetcher:
@@ -81,7 +83,7 @@ class FundamentalsFetcher:
         return 0.045
 
     def _fetch(self, symbol: str) -> Optional[FundamentalData]:
-        ticker = yf.Ticker(symbol)
+        ticker = yf.Ticker(symbol.replace(".", "-"))
         info = ticker.info
 
         if not info or info.get("regularMarketPrice") is None:

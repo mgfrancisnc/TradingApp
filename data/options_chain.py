@@ -194,7 +194,9 @@ class OptionsChainAnalyzer:
                 and c.bid_price > 0
             ]
             if not calls:
-                return self._synthetic_strike(current_price, delta_target, dte_min, dte_max)
+                # No delta data (paper accounts don't return greeks) —
+                # fall back to ATM selection by strike proximity using real chain data
+                return self._select_atm_by_price(symbol, chain, current_price, delta_target)
 
         best = min(calls, key=lambda c: abs(c.delta - delta_target))
         mid_price = (best.bid_price + best.ask_price) / 2
@@ -203,8 +205,8 @@ class OptionsChainAnalyzer:
             if mid_price > 0 else 999.0
         )
 
-        daily_vol = getattr(best, "volume", None) or 0
-        oi = getattr(best, "open_interest", None) or 0
+        daily_vol = getattr(best, "volume", None)   # None = unavailable, not zero
+        oi = getattr(best, "open_interest", None)   # None = unavailable, not zero
         liquidity_ok = self._check_liquidity(daily_vol, oi, spread_pct)
 
         logger.debug(
@@ -224,18 +226,71 @@ class OptionsChainAnalyzer:
             liquidity_ok,
         )
 
-    def _check_liquidity(self, daily_vol: int, oi: int, spread_pct: float) -> bool:
+    def _select_atm_by_price(
+        self,
+        symbol: str,
+        chain: list,
+        current_price: float,
+        delta_target: float,
+    ) -> Optional[tuple]:
+        """
+        Fallback when greeks are unavailable (e.g. Alpaca paper accounts).
+        Picks the call closest to current price (ATM proxy) from the real chain.
+        Volume is not checked because Alpaca paper doesn't return it — only OI and spread.
+        """
+        calls = [
+            c for c in chain
+            if c.type == "call"
+            and c.bid_price is not None
+            and c.ask_price is not None
+            and c.bid_price > 0
+        ]
+        if not calls:
+            return self._synthetic_strike(current_price, delta_target, 28, 35)
+
+        best = min(calls, key=lambda c: abs(c.strike_price - current_price))
+        mid_price = (best.bid_price + best.ask_price) / 2
+        spread_pct = (
+            (best.ask_price - best.bid_price) / mid_price * 100
+            if mid_price > 0 else 999.0
+        )
+        oi = getattr(best, "open_interest", None)  # None = unavailable, not zero
+
+        u = self.phil.get("universe", {}).get("options_liquidity", {})
+        oi_min = u.get("open_interest_min", 500)
+        spread_max = u.get("bid_ask_spread_max_pct", 5.0)
+        oi_ok = oi is None or oi >= oi_min
+        liquidity_ok = oi_ok and spread_pct <= spread_max
+
+        logger.debug(
+            f"{symbol}: ATM by price ${best.strike_price} delta≈{delta_target} "
+            f"premium=${mid_price:.2f} oi={oi} spread={spread_pct:.1f}% "
+            f"liquidity={'OK' if liquidity_ok else 'FAIL'} (no greeks — paper account)"
+        )
+        return (
+            best.strike_price,
+            best.expiry,
+            delta_target,
+            round(mid_price, 2),
+            0,
+            oi,
+            round(spread_pct, 1),
+            liquidity_ok,
+        )
+
+    def _check_liquidity(self, daily_vol: Optional[int], oi: Optional[int], spread_pct: float) -> bool:
         """
         Validates options liquidity gates from philosophy.yaml.
-        All three must pass for the trade to proceed.
+        None means data unavailable (paper account limitation) — treated as passing.
+        0 means confirmed zero — treated as failing.
         """
         u = self.phil.get("universe", {}).get("options_liquidity", {})
         vol_min = u.get("daily_contract_volume_min", 1000)
         oi_min = u.get("open_interest_min", 500)
         spread_max = u.get("bid_ask_spread_max_pct", 5.0)
 
-        vol_ok = daily_vol >= vol_min
-        oi_ok = oi >= oi_min
+        vol_ok = daily_vol is None or daily_vol >= vol_min
+        oi_ok = oi is None or oi >= oi_min
         spread_ok = spread_pct <= spread_max
 
         if not (vol_ok and oi_ok and spread_ok):

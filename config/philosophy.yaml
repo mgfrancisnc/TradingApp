@@ -26,12 +26,12 @@ strategy:
 # "Daily is too easy to be hit fake"
 # ─────────────────────────────────────────────
 trend:
-  primary_timeframe: monthly        # Monthly is the boss
-  confirmation_timeframe: weekly    # Weekly must agree
-  ignore_timeframe: daily           # Too noisy, never trade off daily
-  buying_windows:                   # "Most buying occurs Friday PM and Monday AM"
-    - friday_afternoon              # Friday 2pm-4pm ET
-    - monday_morning                # Monday 9:30am-11am ET
+  primary_timeframe: monthly # Monthly is the boss
+  confirmation_timeframe: weekly # Weekly must agree
+  ignore_timeframe: daily # Too noisy, never trade off daily
+  buying_windows: # "Most buying occurs Friday PM and Monday AM"
+    - friday_afternoon # Friday 2pm-4pm ET
+    - monday_morning # Monday 9:30am-11am ET
 
 # ─────────────────────────────────────────────
 # STOCK CLASSIFICATION
@@ -41,8 +41,8 @@ trend:
 stock_types:
   growth:
     primary_metric: CAGR
-    red_flag: revenue_deceleration  # "Paid for 20%, got 10% — very hard to compound"
-    revenue_over_earnings: true     # "You can't lie about revenue"
+    red_flag: revenue_deceleration # "Paid for 20%, got 10% — very hard to compound"
+    revenue_over_earnings: true # "You can't lie about revenue"
     acceptable_beta: ">1.0"
     covered_call_note: >
       Use caution — rapid appreciation risks assignment at low strikes before
@@ -50,9 +50,9 @@ stock_types:
 
   income:
     primary_metric: dividend_yield_vs_treasury
-    minimum_yield_above_treasury: true  # "Otherwise just buy treasuries"
+    minimum_yield_above_treasury: true # "Otherwise just buy treasuries"
     red_flag: yield_below_10yr_treasury
-    preferred_beta: "<1.0"          # Lower volatility preferred
+    preferred_beta: "<1.0" # Lower volatility preferred
     covered_call_note: >
       Preferred universe. Stable price appreciation + call premium = predictable yield.
 
@@ -61,16 +61,16 @@ stock_types:
 # Large-cap, liquid names only. No small caps, no niche names.
 # ─────────────────────────────────────────────
 universe:
-  market_cap_min_billions: 10       # $10B minimum — large-cap only
-  exchanges:                        # NYSE and NASDAQ only
+  market_cap_min_billions: 10 # $10B minimum — large-cap only
+  exchanges: # NYSE and NASDAQ only
     - NYSE
     - NASDAQ
   stock_liquidity:
     avg_daily_volume_min: 1_000_000 # ≥1M shares/day
   options_liquidity:
     daily_contract_volume_min: 1000 # ≥1,000 contracts/day on front month
-    open_interest_min: 500          # ≥500 OI at target strikes
-    bid_ask_spread_max_pct: 5.0     # ≤5% of mid-price at target strike
+    open_interest_min: 500 # ≥500 OI at target strikes
+    bid_ask_spread_max_pct: 5.0 # ≤5% of mid-price at target strike
   baseline: >
     S&P 100 + select mega-caps + major sector ETFs (~100-150 names total)
 
@@ -79,26 +79,26 @@ universe:
 # ─────────────────────────────────────────────
 covered_call:
   # Strike selection — ATM, delta-based
-  delta_target: 0.50                # Default target delta (ATM)
-  delta_min: 0.45                   # Acceptable range floor
-  delta_max: 0.55                   # Acceptable range ceiling
+  delta_target: 0.50 # Default target delta (ATM)
+  delta_min: 0.45 # Acceptable range floor
+  delta_max: 0.55 # Acceptable range ceiling
 
   # Expiration
-  expiry_dte_min: 28                # Minimum days to expiration
-  expiry_dte_max: 35                # Maximum days to expiration
+  expiry_dte_min: 28 # Minimum days to expiration
+  expiry_dte_max: 35 # Maximum days to expiration
 
   # Coverage rule
-  coverage_pct: 100                 # Every 100-share lot must have a call written
+  coverage_pct: 100 # Every 100-share lot must have a call written
 
   # Minimum premium quality
-  min_premium_pct_of_stock: 0.5    # Premium must be ≥0.5% of stock price per contract
+  min_premium_pct_of_stock: 0.5 # Premium must be ≥0.5% of stock price per contract
 
   # Hold to expiration — no exceptions
-  early_close: false                # Never close early
-  roll_positions: false             # Never roll — let assignment happen
+  early_close: false # Never close early
+  roll_positions: false # Never roll — let assignment happen
 
   # Assignment policy
-  assignment_policy: accept         # Assignment is the intended outcome, not a failure
+  assignment_policy: accept # Assignment is the intended outcome, not a failure
 
 # ─────────────────────────────────────────────
 # HARD RULES (BINARY GATES)
@@ -108,32 +108,32 @@ hard_rules:
   monthly_trend_must_be_up: true
   weekly_trend_must_confirm_monthly: true
   price_not_breaking_support: true
-  revenue_growth_positive_or_stable: true   # Positive YoY, or no severe deceleration
-  revenue_deceleration_max_pct: 50          # Growth can't drop by more than half YoY
-  put_call_sentiment_not_bearish: true      # 6-12mo put/call must not favor puts
-  portfolio_below_max_positions: true       # Must be under 20-position cap
-  familiarity_required: true               # "If you're not familiar with it — don't touch it"
-  min_shares_owned: 100                    # Must own ≥100 shares before writing a call
-  iv_rank_min: 30                          # IV rank must be >30 to sell premium
-  options_liquidity_gates: true            # Volume, OI, bid-ask must all pass
-  earnings_blackout: hard                  # No calls expiring after an earnings date
+  revenue_growth_positive_or_stable: true # Positive YoY, or no severe deceleration
+  revenue_deceleration_max_pct: 50 # Growth can't drop by more than half YoY
+  put_call_sentiment_not_bearish: true # 6-12mo put/call must not favor puts
+  portfolio_below_max_positions: true # Must be under 20-position cap
+  familiarity_required: true # "If you're not familiar with it — don't touch it"
+  min_shares_owned: 100 # Must own ≥100 shares before writing a call
+  iv_rank_min: 30 # IV rank must be >30 to sell premium
+  options_liquidity_gates: true # Volume, OI, bid-ask must all pass
+  earnings_blackout: hard # No calls expiring after an earnings date
 
 # ─────────────────────────────────────────────
 # RISK MANAGEMENT
 # ─────────────────────────────────────────────
 risk:
   # Position limits
-  max_positions: 20                 # Hard cap — 20 names max
-  target_positions: 10              # Sweet spot for active management
+  max_positions: 20 # Hard cap — 20 names max
+  target_positions: 10 # Sweet spot for active management
 
   # Position sizing
-  max_position_size_pct: 5.0        # Never more than 5% of portfolio per name
+  max_position_size_pct: 5.0 # Never more than 5% of portfolio per name
 
   # Circuit breaker
-  max_daily_loss_pct: 3.0           # Halt all new positions if portfolio drops ≥3% in one day
+  max_daily_loss_pct: 3.0 # Halt all new positions if portfolio drops ≥3% in one day
 
   # Assignment handling
-  on_assignment: return_cash_to_pool  # Cash goes back to available pool for next cycle
+  on_assignment: return_cash_to_pool # Cash goes back to available pool for next cycle
 
 # ─────────────────────────────────────────────
 # OPTIONS SENTIMENT
@@ -143,15 +143,15 @@ risk:
 options_sentiment:
   lookout_window_months_min: 6
   lookout_window_months_max: 12
-  put_call_bullish_threshold: 1.0   # Calls must outweigh puts (>1.0 = more calls than puts)
-  strong_bullish_threshold: 2.0     # 2:1 calls to puts = "very bullish"
+  put_call_bullish_threshold: 1.0 # Calls must outweigh puts (>1.0 = more calls than puts)
+  strong_bullish_threshold: 2.0 # 2:1 calls to puts = "very bullish"
 
 # ─────────────────────────────────────────────
 # VOLUME
 # "Volume predicts price — the more volume, the more price"
 # ─────────────────────────────────────────────
 volume:
-  trend_must_be_positive: true      # Rising volume confirms rising price
+  trend_must_be_positive: true # Rising volume confirms rising price
 
 # ─────────────────────────────────────────────
 # FUNDAMENTALS
@@ -168,7 +168,7 @@ fundamentals:
 # ─────────────────────────────────────────────
 benchmark:
   risk_free_instrument: 10yr_treasury
-  income_stock_min_yield_premium: 0  # Dividend yield must beat treasury — period
+  income_stock_min_yield_premium: 0 # Dividend yield must beat treasury — period
   fetch_live_treasury_rate: true
 
 # ─────────────────────────────────────────────
@@ -177,16 +177,85 @@ benchmark:
 # Must reach ≥60% to be approved for the scan report
 # ─────────────────────────────────────────────
 scoring:
-  approval_threshold: 0.60          # Minimum score to appear on approved list
+  approval_threshold: 0.60 # Minimum score to appear on approved list
 
   weights:
-    iv_rank: 0.20                   # Premium quality — are we being paid well to sell?
-    monthly_trend_strength: 0.20    # Monthly chart dictates direction
-    options_liquidity: 0.10         # Can we get filled at a fair price?
-    put_call_ratio: 0.10            # Smart money sentiment 6-12mo out
-    volume_trend: 0.10              # Volume predicts price
-    beta_fit: 0.10                  # Volatility appropriate for covered call writing
-    premium_to_capital_ratio: 0.05  # Annualized yield from this call
-    revenue_cagr_stability: 0.05    # Revenue growing or holding steady
-    yield_vs_risk_free: 0.05        # For income stocks: dividend + premium beats treasury
+    iv_rank: 0.20 # Premium quality — are we being paid well to sell?
+    monthly_trend_strength: 0.20 # Monthly chart dictates direction
+    options_liquidity: 0.10 # Can we get filled at a fair price?
+    put_call_ratio: 0.10 # Smart money sentiment 6-12mo out
+    volume_trend: 0.10 # Volume predicts price
+    beta_fit: 0.10 # Volatility appropriate for covered call writing
+    premium_to_capital_ratio: 0.05 # Annualized yield from this call
+    revenue_cagr_stability: 0.05 # Revenue growing or holding steady
+    yield_vs_risk_free: 0.05 # For income stocks: dividend + premium beats treasury
     weekly_trend_confirmation: 0.05 # Secondary — confirms monthly only
+
+# ─────────────────────────────────────────────
+# IMPLEMENTATION NOTES
+# Operational rules and data adaptations captured during live testing.
+# These document deviations from the ideal that are required in practice.
+# ─────────────────────────────────────────────
+implementation_notes:
+  iv_rank_data_unavailable:
+    rule: >
+      If IV rank cannot be computed (yfinance or Alpaca returns no data),
+      the hard rule does NOT block the trade. A warning is logged.
+    reason: >
+      Paper trading accounts have limited options data. Blocking on missing
+      data would reject all candidates even when the signal is genuinely unavailable.
+    behaviour: warn_and_continue
+    applies_to: hard_rules.iv_rank_min
+
+  options_liquidity_data_unavailable:
+    rule: >
+      Alpaca paper accounts do not return options daily volume or open interest
+      in snapshots (both come back as None). When a value is None (data absent),
+      that specific gate is treated as passing — only the bid-ask spread is
+      reliably checked because bid/ask prices ARE returned from last Friday close.
+      On a live account all three gates (volume ≥1000, OI ≥500, spread ≤5%)
+      will be enforced in full.
+    reason: >
+      Paper account API limitation. Treating None as "unavailable" rather than
+      zero prevents all large-cap names from failing a liquidity gate that simply
+      can't be measured in paper mode.
+    behaviour: none_treated_as_data_unavailable_not_illiquid
+
+  delta_unavailable:
+    rule: >
+      Alpaca paper accounts do not return option greeks (delta) in snapshots.
+      When no contracts have delta data, the bot selects the call closest to
+      the current stock price as the ATM proxy and assigns delta ≈ 0.50.
+    reason: >
+      Paper account limitation. On a live account, delta-based selection
+      (target 0.50, range 0.45-0.55) is used directly.
+    behaviour: atm_by_strike_proximity
+
+  familiarity_gate:
+    rule: >
+      The `familiarity_confirmed` flag defaults to True for all scanned names.
+      Familiarity is enforced as a human check at the Monday review step,
+      not programmatically by the bot.
+    reason: >
+      The bot cannot assess whether the team knows a company well enough.
+      Hayes' rule 'if you don't know it, don't touch it' is a judgment call
+      that belongs with the human reviewer, not the screener.
+    behaviour: human_enforced_at_review
+
+  earnings_gate:
+    rule: >
+      The `earnings_in_window` flag defaults to False (no conflict assumed).
+      Live earnings date fetching is not yet implemented.
+      Reviewers must manually verify no earnings fall within the expiry window.
+    reason: >
+      Earnings date APIs require additional setup. Until implemented,
+      this gate is a manual check in the Monday review process.
+    behaviour: human_enforced_at_review
+
+  symbol_format:
+    rule: >
+      TradingView and Alpaca use dot notation for share classes (e.g. BRK.B).
+      yfinance uses hyphen notation (e.g. BRK-B).
+      The bot normalizes automatically: dots are kept for Alpaca API calls
+      and converted to hyphens for all yfinance calls.
+    behaviour: auto_normalized_per_data_source

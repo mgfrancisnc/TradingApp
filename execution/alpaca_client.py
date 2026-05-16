@@ -32,7 +32,7 @@ class OptionContractInfo:
     """
     Normalised view of an option contract.
     Parsed from the OCC symbol so the upstream code only sees .type,
-    .strike_price, .bid_price, .ask_price, .open_interest.
+    .strike_price, .bid_price, .ask_price, .open_interest, .delta.
     """
     symbol: str            # Full OCC option symbol
     underlying: str
@@ -43,6 +43,7 @@ class OptionContractInfo:
     ask_price: Optional[float]
     open_interest: Optional[int]
     implied_volatility: Optional[float]
+    delta: Optional[float] = None   # From greeks; None on paper accounts
 
     @classmethod
     def from_snapshot(cls, snap) -> Optional["OptionContractInfo"]:
@@ -54,6 +55,7 @@ class OptionContractInfo:
             ask = None
             oi = None
             iv = None
+            delta = None
             if snap.latest_quote:
                 bid = float(snap.latest_quote.bid_price) if snap.latest_quote.bid_price else None
                 ask = float(snap.latest_quote.ask_price) if snap.latest_quote.ask_price else None
@@ -61,6 +63,9 @@ class OptionContractInfo:
                 oi = int(snap.open_interest)
             if hasattr(snap, "implied_volatility") and snap.implied_volatility:
                 iv = float(snap.implied_volatility)
+            # Greeks may be available on live accounts but not paper
+            if hasattr(snap, "greeks") and snap.greeks and hasattr(snap.greeks, "delta"):
+                delta = float(snap.greeks.delta) if snap.greeks.delta is not None else None
             return cls(
                 symbol=sym,
                 underlying=underlying,
@@ -71,6 +76,7 @@ class OptionContractInfo:
                 ask_price=ask,
                 open_interest=oi,
                 implied_volatility=iv,
+                delta=delta,
             )
         except Exception as e:
             logger.debug(f"Could not parse option snapshot {getattr(snap, 'symbol', '?')}: {e}")
@@ -201,7 +207,7 @@ class AlpacaClient:
         try:
             import yfinance as yf
             import numpy as np
-            ticker = yf.Ticker(symbol)
+            ticker = yf.Ticker(symbol.replace(".", "-"))
 
             # Get current ATM IV from nearest options expiry
             expirations = ticker.options
@@ -284,7 +290,7 @@ class AlpacaClient:
             from alpaca.data.enums import ContractType
             ctype = ContractType.CALL if option_type.lower() == "call" else ContractType.PUT
             req = OptionChainRequest(
-                symbol_or_symbols=symbol,
+                underlying_symbol=symbol,
                 expiration_date_gte=expiry_start,
                 expiration_date_lte=expiry_end,
                 type=ctype,
@@ -292,7 +298,7 @@ class AlpacaClient:
         except (ImportError, AttributeError):
             # Older alpaca-py versions use string literals
             req = OptionChainRequest(
-                symbol_or_symbols=symbol,
+                underlying_symbol=symbol,
                 expiration_date_gte=expiry_start,
                 expiration_date_lte=expiry_end,
             )
@@ -329,7 +335,7 @@ class AlpacaClient:
 
         try:
             req = OptionChainRequest(
-                symbol_or_symbols=symbol,
+                underlying_symbol=symbol,
                 expiration_date_gte=expiry_start,
                 expiration_date_lte=expiry_end,
             )

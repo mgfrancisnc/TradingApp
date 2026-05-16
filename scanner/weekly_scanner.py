@@ -18,6 +18,7 @@ No trades fire without explicit human approval.
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -325,75 +326,103 @@ class WeeklyScanner:
         portfolio_value: float,
         open_positions: list,
     ):
+        report = self._build_report(results, portfolio_value, open_positions)
+        print(report)
+        self._save_report(report)
+
+    def _build_report(
+        self,
+        results: list[ScanResult],
+        portfolio_value: float,
+        open_positions: list,
+    ) -> str:
         now = datetime.now().strftime("%A %B %d, %Y %I:%M %p")
         approved_lots = [r for r in results if r.approved and r.scan_type == "uncovered_lot"]
         approved_new = [r for r in results if r.approved and r.scan_type == "new_candidate"]
         watchlist = [r for r in results if not r.approved]
         total_income = sum(r.premium_total or 0 for r in results if r.approved)
 
-        print("\n" + "=" * 65)
-        print(f"  FRANCIS-HAYES TRADING BOT — WEEKLY SCAN REPORT")
-        print(f"  {now}")
-        print("=" * 65)
-        print(f"  Portfolio Value:   ${portfolio_value:,.0f}")
-        print(f"  Open Positions:    {len(open_positions)} / {self.phil['risk']['max_positions']}")
-        print(f"  Uncovered Lots:    {len(approved_lots)} approved")
-        print(f"  New Candidates:    {len(approved_new)} approved")
-        print(f"  Est. Total Income: ${total_income:,.0f} (if all approved trades execute)")
-        print("=" * 65)
+        lines = []
+        lines.append("")
+        lines.append("=" * 65)
+        lines.append("  FRANCIS-HAYES TRADING BOT — WEEKLY SCAN REPORT")
+        lines.append(f"  {now}")
+        lines.append("=" * 65)
+        lines.append(f"  Portfolio Value:   ${portfolio_value:,.0f}")
+        lines.append(f"  Open Positions:    {len(open_positions)} / {self.phil['risk']['max_positions']}")
+        lines.append(f"  Uncovered Lots:    {len(approved_lots)} approved")
+        lines.append(f"  New Candidates:    {len(approved_new)} approved")
+        lines.append(f"  Est. Total Income: ${total_income:,.0f} (if all approved trades execute)")
+        lines.append("=" * 65)
 
-        # Uncovered lots — highest priority
         if approved_lots:
-            print(f"\n  UNCOVERED LOTS — READY TO WRITE ({len(approved_lots)} positions)")
-            print("  We own these shares. Just need to write the call.")
-            print("  " + "-" * 60)
+            lines.append(f"\n  UNCOVERED LOTS — READY TO WRITE ({len(approved_lots)} positions)")
+            lines.append("  We own these shares. Just need to write the call.")
+            lines.append("  " + "-" * 60)
             for r in approved_lots:
-                self._print_approved(r)
+                lines.extend(self._format_approved(r))
 
-        # New candidates — buy-write
         if approved_new:
-            print(f"\n\n  NEW CANDIDATES — BUY-WRITE ({len(approved_new)} names)")
-            print("  Would require buying 100 shares + writing a call.")
-            print("  " + "-" * 60)
+            lines.append(f"\n\n  NEW CANDIDATES — BUY-WRITE ({len(approved_new)} names)")
+            lines.append("  Would require buying 100 shares + writing a call.")
+            lines.append("  " + "-" * 60)
             for r in approved_new:
-                self._print_approved(r)
+                lines.extend(self._format_approved(r))
 
-        # Watchlist
         if watchlist:
-            print(f"\n\n  WATCHLIST — Not Yet Qualifying ({len(watchlist)} names)")
-            print("  " + "-" * 60)
+            lines.append(f"\n\n  WATCHLIST — Not Yet Qualifying ({len(watchlist)} names)")
+            lines.append("  " + "-" * 60)
             for r in watchlist[:10]:
                 rules_str = ", ".join(r.failed_rules[:2]) or "score below 60%"
-                print(
+                iv_str = f"{r.iv_rank:.0f}" if r.iv_rank is not None else "N/A"
+                lines.append(
                     f"  {r.symbol:6s}  {r.score:.0%}  "
-                    f"IV rank: {r.iv_rank:.0f if r.iv_rank else 'N/A'}  "
+                    f"IV rank: {iv_str}  "
                     f"Failed: {rules_str}"
                 )
 
-        print("\n" + "=" * 65)
-        print("  REMINDER: Review each name before executing.")
-        print("  Hayes: 'If you're not familiar with the company — don't touch it.'")
-        print("  Run: python bot.py execute")
-        print("=" * 65 + "\n")
+        lines.append("\n" + "=" * 65)
+        lines.append("  REMINDER: Review each name before executing.")
+        lines.append("  Hayes: 'If you're not familiar with the company — don't touch it.'")
+        lines.append("  Run: python bot.py execute")
+        lines.append("=" * 65 + "\n")
 
-    def _print_approved(self, r: ScanResult):
+        return "\n".join(lines)
+
+    def _save_report(self, report: str):
+        """Saves the report to data/reports/scan_YYYY-MM-DD_HHMM.txt."""
+        try:
+            reports_dir = os.path.join(os.path.dirname(__file__), "..", "data", "reports")
+            os.makedirs(reports_dir, exist_ok=True)
+            filename = datetime.now().strftime("scan_%Y-%m-%d_%H%M.txt")
+            path = os.path.join(reports_dir, filename)
+            with open(path, "w") as f:
+                f.write(report)
+            logger.info(f"Report saved to {os.path.abspath(path)}")
+        except Exception as e:
+            logger.warning(f"Could not save report to file: {e}")
+
+    def _format_approved(self, r: ScanResult) -> list[str]:
         premium_str = f"${r.premium_total:,.0f}" if r.premium_total else "unknown"
         per_share_str = f"${r.premium_per_share:.2f}/share" if r.premium_per_share else ""
         iv_str = f"IV rank: {r.iv_rank:.0f}" if r.iv_rank else "IV rank: N/A"
 
-        print(f"\n  {r.symbol} [{r.stock_type.upper()}]  Score: {r.score:.0%}  {iv_str}")
-        print(f"  {r.company_brief}")
+        lines = []
+        lines.append(f"\n  {r.symbol} [{r.stock_type.upper()}]  Score: {r.score:.0%}  {iv_str}")
+        lines.append(f"  {r.company_brief}")
         if r.recommended_strike and r.recommended_expiry:
-            print(
-                f"  Strike: ${r.recommended_strike:.2f}  (delta {r.delta:.2f if r.delta else '~0.50'})  "
+            delta_str = f"{r.delta:.2f}" if r.delta is not None else "~0.50"
+            lines.append(
+                f"  Strike: ${r.recommended_strike:.2f}  (delta {delta_str})  "
                 f"Expiry: {r.recommended_expiry}"
             )
-        print(
+        lines.append(
             f"  Contracts: {r.contracts_to_write or '?'}  |  "
             f"Income: {per_share_str}  =  {premium_str}"
         )
-        print(
+        lines.append(
             f"  Put/Call: {r.put_call_ratio:.1f}x ({r.put_call_sentiment})  |  "
             f"Volume: {r.volume_trend}  |  "
             f"Monthly: {r.monthly_trend} {'confirmed' if r.weekly_confirms else 'unconfirmed'}"
         )
+        return lines

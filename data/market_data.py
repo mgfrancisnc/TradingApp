@@ -97,7 +97,7 @@ class MarketDataAnalyzer:
     # ─────────────────────────────────────────────
 
     def _run_analysis(self, symbol: str) -> Optional[TrendAnalysis]:
-        ticker = yf.Ticker(symbol)
+        ticker = yf.Ticker(symbol.replace(".", "-"))
 
         # Pull 3 years of monthly data (need 12+ bars for SMA)
         monthly = ticker.history(period="3y", interval="1mo")

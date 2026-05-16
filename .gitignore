@@ -19,6 +19,7 @@ venv/
 # Bot runtime data
 data/*.json
 data/*.csv
+data/reports/
 *.log
 logs/
 
