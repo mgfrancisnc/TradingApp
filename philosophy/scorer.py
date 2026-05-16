@@ -3,26 +3,33 @@ scorer.py
 Hard rules gate and philosophy scoring engine for the Francis-Hayes Trading Bot.
 
 Two components:
-  HardRules   — binary pass/fail checks (any failure blocks a trade)
-  PhilosophyScorer — weighted 0-1 score from philosophy.yaml weights
+  HardRules        — binary pass/fail checks; any failure blocks the trade
+  PhilosophyScorer — weighted 0-1 conviction score; must reach ≥60% to approve
 
-Hard rules encoded from Hayes' recording:
-  - Monthly trend must be bullish (never fight the monthly)
-  - Weekly must confirm monthly (not contradict)
-  - Do not buy if breaking support
-  - Revenue growth must be positive
-  - Revenue cannot be decelerating by more than 50% YoY
-  - Put/call sentiment cannot be bearish
-  - Portfolio cannot exceed 20 positions
+Hard rules (all must pass):
+  - Monthly trend must be bullish
+  - Weekly must confirm monthly
+  - Not breaking support
+  - Revenue growing or stable (not decelerating >50% YoY)
+  - Put/call sentiment not bearish (6-12mo)
+  - Portfolio below 20-position cap
+  - Stock sufficiently familiar
+  - Must own ≥100 shares of underlying before writing a call
+  - IV rank must be >30
+  - Options liquidity gates must pass
+  - No earnings event within the option's expiry window
 
-Scoring uses the weights in philosophy.yaml:
-  monthly_trend_strength: 0.25
-  revenue_growth_cagr:    0.20
-  put_call_ratio_skew:    0.15
-  volume_trend:           0.15
-  beta_fit:               0.10
-  yield_vs_risk_free:     0.10
-  weekly_trend_confirmation: 0.05
+Scoring weights (v3.0 assignment-targeting covered calls):
+  iv_rank:                 0.20
+  monthly_trend_strength:  0.20
+  options_liquidity:       0.10
+  put_call_ratio:          0.10
+  volume_trend:            0.10
+  beta_fit:                0.10
+  premium_to_capital:      0.05
+  revenue_cagr_stability:  0.05
+  yield_vs_risk_free:      0.05
+  weekly_trend:            0.05
 """
 
 import logging
@@ -30,8 +37,6 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger(__name__)
-
-APPROVAL_THRESHOLD = 0.60   # Must score ≥ 60% to be approved
 
 
 @dataclass
@@ -42,16 +47,16 @@ class RulesResult:
 
 @dataclass
 class ScoreResult:
-    total_score: float          # 0.0 – 1.0
-    approved: bool              # total_score >= APPROVAL_THRESHOLD
-    component_scores: dict      # {component_name: score}
+    total_score: float      # 0.0-1.0
+    approved: bool          # total_score >= threshold from philosophy.yaml
+    component_scores: dict  # {component_name: weighted_contribution}
+    raw_scores: dict        # {component_name: 0-1 sub-score before weighting}
 
 
 class HardRules:
     """
-    Binary gate: all rules must pass for a trade to be approved.
-    A single failure removes the candidate from the approved list
-    (it still appears in the watchlist section of the report).
+    Binary gate: all rules must pass or the trade is rejected.
+    Failed candidates still appear in the report watchlist — just not approved.
     """
 
     def __init__(self, philosophy: dict):
@@ -61,137 +66,197 @@ class HardRules:
         self,
         symbol: str,
         monthly_trend: str,
-        weekly_trend: str,
         weekly_confirms_monthly: bool,
         breaking_support: bool,
-        revenue_growth_pct: Optional[float],
-        revenue_accelerating: bool,
+        revenue_growth_pct: Optional[float],    # YoY revenue growth as decimal (0.10 = 10%)
+        revenue_deceleration_ok: bool,          # False if growth dropped >50% YoY
         put_call_sentiment: str,
         max_positions_reached: bool,
+        familiarity_confirmed: bool,
+        shares_owned: int,                      # Must be ≥100 to write a covered call
+        iv_rank: Optional[float],               # Must be >30
+        liquidity_ok: bool,                     # Options chain liquidity gates
+        earnings_in_window: bool,               # True if earnings fall within expiry window
     ) -> RulesResult:
 
+        rules = self.phil.get("hard_rules", {})
         failed = []
 
-        # ── Portfolio cap ─────────────────────────────────────
+        # ── Portfolio cap ──────────────────────────────────────
         if max_positions_reached:
             failed.append("portfolio at 20-position limit")
 
-        # ── Monthly trend — the boss ──────────────────────────
+        # ── Monthly trend — the boss ───────────────────────────
         if monthly_trend != "bullish":
-            failed.append(f"monthly trend {monthly_trend} (need bullish)")
+            failed.append(f"monthly trend is {monthly_trend} (must be bullish)")
 
-        # ── Weekly confirmation ───────────────────────────────
+        # ── Weekly confirmation ────────────────────────────────
         if not weekly_confirms_monthly:
-            failed.append("weekly contradicts monthly")
+            failed.append("weekly trend contradicts monthly")
 
-        # ── Breaking support ──────────────────────────────────
+        # ── Support break ──────────────────────────────────────
         if breaking_support:
-            failed.append("breaking support")
+            failed.append("price breaking through support")
 
-        # ── Revenue must be growing ───────────────────────────
+        # ── Revenue must be positive or stable ─────────────────
         if revenue_growth_pct is not None and revenue_growth_pct <= 0:
             failed.append(f"revenue growth negative ({revenue_growth_pct:.1%})")
 
-        # ── Revenue deceleration check ────────────────────────
-        # Hayes: 'Paid for 20% growth, got 10% — that's very hard to compound'
-        if not revenue_accelerating:
+        # ── Revenue deceleration — Hayes: 'paid for 20%, got 10%' ─
+        if not revenue_deceleration_ok:
             failed.append("revenue decelerating >50% YoY")
 
-        # ── Options sentiment ─────────────────────────────────
+        # ── Options sentiment ──────────────────────────────────
         if put_call_sentiment == "bearish":
             failed.append("options sentiment bearish (6-12mo)")
 
+        # ── Familiarity — Hayes: 'if you don't know it, don't touch it' ─
+        if not familiarity_confirmed:
+            failed.append("stock not sufficiently familiar")
+
+        # ── Must own ≥100 shares before writing a covered call ─
+        min_shares = rules.get("min_shares_owned", 100)
+        if shares_owned < min_shares:
+            failed.append(f"only {shares_owned} shares owned (need ≥{min_shares} to write a call)")
+
+        # ── IV rank gate — only sell premium when IV is elevated ─
+        iv_min = rules.get("iv_rank_min", 30)
+        if iv_rank is None:
+            failed.append("IV rank unavailable")
+        elif iv_rank <= iv_min:
+            failed.append(f"IV rank {iv_rank:.0f} too low (need >{iv_min})")
+
+        # ── Options liquidity gates ────────────────────────────
+        if not liquidity_ok:
+            failed.append("options chain fails liquidity gates (volume/OI/spread)")
+
+        # ── Earnings blackout ──────────────────────────────────
+        if earnings_in_window:
+            failed.append("earnings event falls within option expiry window")
+
         passed = len(failed) == 0
         if not passed:
-            logger.debug(f"{symbol}: rules failed — {failed}")
+            logger.debug(f"{symbol}: hard rules failed — {failed}")
 
         return RulesResult(passed=passed, failed_rules=failed)
 
 
 class PhilosophyScorer:
     """
-    Weighted scoring engine.
-    Each component produces a 0-1 sub-score; final score is the weighted sum.
-    Weights come from philosophy.yaml → scoring_weights.
+    Weighted conviction scorer — runs only after all hard rules pass.
+    Weights and threshold are read from philosophy.yaml → scoring section.
     """
 
     def __init__(self, philosophy: dict):
         self.phil = philosophy
-        weights = philosophy.get("scoring_weights", {})
+        scoring = philosophy.get("scoring", {})
+        weights = scoring.get("weights", {})
 
-        self.w_monthly = weights.get("monthly_trend_strength", 0.25)
-        self.w_revenue = weights.get("revenue_growth_cagr", 0.20)
-        self.w_pc = weights.get("put_call_ratio_skew", 0.15)
-        self.w_volume = weights.get("volume_trend", 0.15)
-        self.w_beta = weights.get("beta_fit", 0.10)
-        self.w_yield = weights.get("yield_vs_risk_free", 0.10)
-        self.w_weekly = weights.get("weekly_trend_confirmation", 0.05)
+        self.threshold = scoring.get("approval_threshold", 0.60)
+
+        self.w_iv_rank    = weights.get("iv_rank", 0.20)
+        self.w_monthly    = weights.get("monthly_trend_strength", 0.20)
+        self.w_liquidity  = weights.get("options_liquidity", 0.10)
+        self.w_pc         = weights.get("put_call_ratio", 0.10)
+        self.w_volume     = weights.get("volume_trend", 0.10)
+        self.w_beta       = weights.get("beta_fit", 0.10)
+        self.w_premium    = weights.get("premium_to_capital_ratio", 0.05)
+        self.w_revenue    = weights.get("revenue_cagr_stability", 0.05)
+        self.w_yield      = weights.get("yield_vs_risk_free", 0.05)
+        self.w_weekly     = weights.get("weekly_trend_confirmation", 0.05)
 
     def score(
         self,
         symbol: str,
+        # Trend
         monthly_trend_strength: float,          # 0-1 from market_data
         weekly_confirms_monthly: bool,
-        revenue_cagr_pct: Optional[float],      # e.g. 0.20 = 20%
-        revenue_growth_yoy: Optional[float],
+        volume_trend_score: float,              # 0-1 from market_data
+        # Options quality
+        iv_rank: Optional[float],               # 0-100 from options_chain
+        put_call_sentiment_score: float,        # 0-1 from options_chain
+        liquidity_ok: bool,                     # from options_chain
+        premium_to_stock_pct: Optional[float],  # e.g. 1.5 means 1.5% of stock price
+        # Fundamentals
         stock_type: str,                        # 'growth' or 'income'
+        revenue_cagr_pct: Optional[float],      # e.g. 0.10 = 10%
+        revenue_growth_yoy: Optional[float],
+        beta: Optional[float],
         dividend_yield: Optional[float],
         treasury_rate: float,
-        beta: Optional[float],
-        put_call_sentiment_score: float,        # 0-1 from options_chain
-        volume_trend_score: float,              # 0-1 from market_data
     ) -> ScoreResult:
 
-        components = {}
+        raw = {}
 
-        # ── Monthly trend strength (0-1, already normalised) ──
-        components["monthly_trend"] = monthly_trend_strength
+        raw["iv_rank"]     = self._score_iv_rank(iv_rank)
+        raw["monthly"]     = monthly_trend_strength
+        raw["liquidity"]   = 1.0 if liquidity_ok else 0.0
+        raw["put_call"]    = put_call_sentiment_score
+        raw["volume"]      = volume_trend_score
+        raw["beta"]        = self._score_beta(stock_type, beta)
+        raw["premium"]     = self._score_premium(premium_to_stock_pct)
+        raw["revenue"]     = self._score_revenue(stock_type, revenue_cagr_pct, revenue_growth_yoy)
+        raw["yield"]       = self._score_yield(stock_type, dividend_yield, treasury_rate)
+        raw["weekly"]      = 1.0 if weekly_confirms_monthly else 0.0
 
-        # ── Weekly confirmation ───────────────────────────────
-        components["weekly_confirms"] = 1.0 if weekly_confirms_monthly else 0.0
+        weighted = {
+            "iv_rank":    raw["iv_rank"]   * self.w_iv_rank,
+            "monthly":    raw["monthly"]   * self.w_monthly,
+            "liquidity":  raw["liquidity"] * self.w_liquidity,
+            "put_call":   raw["put_call"]  * self.w_pc,
+            "volume":     raw["volume"]    * self.w_volume,
+            "beta":       raw["beta"]      * self.w_beta,
+            "premium":    raw["premium"]   * self.w_premium,
+            "revenue":    raw["revenue"]   * self.w_revenue,
+            "yield":      raw["yield"]     * self.w_yield,
+            "weekly":     raw["weekly"]    * self.w_weekly,
+        }
 
-        # ── Revenue growth / CAGR ─────────────────────────────
-        components["revenue_cagr"] = self._score_revenue(
-            stock_type, revenue_cagr_pct, revenue_growth_yoy
+        total = round(min(1.0, max(0.0, sum(weighted.values()))), 3)
+        approved = total >= self.threshold
+
+        logger.debug(
+            f"{symbol}: score {total:.1%} {'✅' if approved else '❌'} "
+            f"iv={raw['iv_rank']:.2f} trend={raw['monthly']:.2f} "
+            f"liq={raw['liquidity']:.2f} premium={raw['premium']:.2f}"
         )
 
-        # ── Put/call sentiment ────────────────────────────────
-        components["put_call"] = put_call_sentiment_score
-
-        # ── Volume trend ──────────────────────────────────────
-        components["volume"] = volume_trend_score
-
-        # ── Beta fit for strategy ────────────────────────────
-        components["beta_fit"] = self._score_beta(stock_type, beta)
-
-        # ── Yield vs risk-free (income stocks) ───────────────
-        components["yield_vs_treasury"] = self._score_yield(
-            stock_type, dividend_yield, treasury_rate
-        )
-
-        # ── Weighted total ────────────────────────────────────
-        total = (
-            components["monthly_trend"]   * self.w_monthly +
-            components["revenue_cagr"]    * self.w_revenue +
-            components["put_call"]        * self.w_pc +
-            components["volume"]          * self.w_volume +
-            components["beta_fit"]        * self.w_beta +
-            components["yield_vs_treasury"] * self.w_yield +
-            components["weekly_confirms"] * self.w_weekly
-        )
-        total = round(min(1.0, max(0.0, total)), 3)
-        approved = total >= APPROVAL_THRESHOLD
-
-        logger.debug(f"{symbol}: score {total:.1%}  {'✅' if approved else '❌'}  {components}")
         return ScoreResult(
             total_score=total,
             approved=approved,
-            component_scores=components,
+            component_scores=weighted,
+            raw_scores=raw,
         )
 
     # ─────────────────────────────────────────────
     # SUB-SCORERS
     # ─────────────────────────────────────────────
+
+    def _score_iv_rank(self, iv_rank: Optional[float]) -> float:
+        """
+        Higher IV rank = better premium collected for the risk taken.
+        Hard rule already blocks <30, so scoring starts above that.
+        """
+        if iv_rank is None:
+            return 0.0
+        if iv_rank >= 80:   return 1.0   # Exceptional premium environment
+        if iv_rank >= 60:   return 0.85  # Very good
+        if iv_rank >= 45:   return 0.70  # Good
+        if iv_rank >= 30:   return 0.50  # Minimum acceptable (just clears hard rule)
+        return 0.0
+
+    def _score_premium(self, premium_to_stock_pct: Optional[float]) -> float:
+        """
+        Premium as a percentage of the stock price — measures yield quality.
+        Philosophy: min 0.5% per cycle; 1%+ is excellent for a monthly call.
+        """
+        if premium_to_stock_pct is None:
+            return 0.3
+        if premium_to_stock_pct >= 2.0:   return 1.0   # ≥2% of stock value — excellent
+        if premium_to_stock_pct >= 1.5:   return 0.85
+        if premium_to_stock_pct >= 1.0:   return 0.70
+        if premium_to_stock_pct >= 0.5:   return 0.50  # Minimum acceptable
+        return 0.1                                      # Below floor — barely worth writing
 
     def _score_revenue(
         self,
@@ -200,51 +265,43 @@ class PhilosophyScorer:
         yoy: Optional[float],
     ) -> float:
         """
-        Growth stocks: CAGR is #1 metric.
-        Income stocks: revenue growth matters less but should be positive.
+        Revenue stability matters more than explosive growth for covered call writing.
+        Hayes: 'You can't lie about revenue.'
         """
         if stock_type == "growth":
-            if cagr is None:
-                return 0.3  # Unknown = moderate penalty
-            if cagr >= 0.30:    return 1.0   # ≥30% CAGR
-            if cagr >= 0.20:    return 0.85  # ≥20% — excellent
-            if cagr >= 0.10:    return 0.70  # ≥10% — solid growth
-            if cagr >= 0.05:    return 0.50  # ≥5%  — marginal
-            if cagr >= 0.0:     return 0.30  # Positive but weak
-            return 0.0                        # Negative CAGR
-
-        else:  # income
-            # For income stocks, revenue stability matters more than speed
-            if yoy is None:
-                return 0.5
-            if yoy >= 0.10:   return 0.85
-            if yoy >= 0.05:   return 0.70
-            if yoy >= 0.0:    return 0.55
-            return 0.2  # Declining revenue is a red flag for income too
+            if cagr is None:    return 0.3
+            if cagr >= 0.20:    return 1.0
+            if cagr >= 0.10:    return 0.75
+            if cagr >= 0.05:    return 0.50
+            if cagr >= 0.0:     return 0.30
+            return 0.0
+        else:  # income — stability over speed
+            if yoy is None:     return 0.5
+            if yoy >= 0.10:     return 1.0
+            if yoy >= 0.05:     return 0.80
+            if yoy >= 0.0:      return 0.60
+            return 0.2
 
     def _score_beta(self, stock_type: str, beta: Optional[float]) -> float:
         """
-        Growth: beta > 1.0 preferred (more leverage to upside).
-        Income: beta < 1.0 preferred (stability for covered call overlay).
-        Hayes: 'Beta tells you volatility relative to market.'
+        For covered call writing, lower beta is generally preferred — less whipsaw.
+        Income stocks: 0.3-0.9 is ideal. Growth: 1.0-1.5 is acceptable.
+        Hayes: 'Beta tells you volatility relative to the market.'
         """
         if beta is None:
             return 0.5
 
-        if stock_type == "growth":
-            # Sweet spot: 1.0–2.0
-            if 1.0 <= beta <= 2.0:   return 1.0
-            if 0.8 <= beta < 1.0:    return 0.7
-            if 2.0 < beta <= 3.0:    return 0.6   # High vol OK but risky
-            if 0.5 <= beta < 0.8:    return 0.4
-            return 0.2  # Very low or very high beta
-
-        else:  # income
-            # Sweet spot: 0.3–0.9
-            if 0.3 <= beta <= 0.9:   return 1.0
-            if 0.9 < beta <= 1.2:    return 0.7
-            if 0.1 <= beta < 0.3:    return 0.6
-            if 1.2 < beta <= 1.5:    return 0.4
+        if stock_type == "income":
+            if 0.3 <= beta <= 0.9:    return 1.0
+            if 0.9 < beta <= 1.2:     return 0.70
+            if 0.1 <= beta < 0.3:     return 0.60
+            if 1.2 < beta <= 1.5:     return 0.40
+            return 0.2
+        else:  # growth
+            if 1.0 <= beta <= 1.5:    return 1.0
+            if 0.8 <= beta < 1.0:     return 0.75
+            if 1.5 < beta <= 2.0:     return 0.60
+            if 0.5 <= beta < 0.8:     return 0.40
             return 0.2
 
     def _score_yield(
@@ -254,20 +311,20 @@ class PhilosophyScorer:
         treasury_rate: float,
     ) -> float:
         """
-        Income stocks: yield must beat the 10-year treasury.
-        Hayes: 'All returns are based on the 10-year treasury.'
-        Growth stocks: dividend yield doesn't matter for this criterion.
+        Income stocks: dividend yield must beat the 10-year treasury.
+        Hayes: 'All returns are based on the 10-year treasury. You have to get above it.'
+        Growth stocks: not applicable — score is neutral.
         """
         if stock_type == "growth":
-            return 0.7  # Not applicable — give neutral-positive score
+            return 0.7  # Not the primary metric for growth names
 
         if dividend_yield is None:
             return 0.0  # Income stock with no dividend is a problem
 
         spread = dividend_yield - treasury_rate
-        if spread >= 0.04:    return 1.0    # 4%+ above treasury
-        if spread >= 0.02:    return 0.85   # 2%+ above
-        if spread >= 0.01:    return 0.70   # 1%+ above
-        if spread >= 0.0:     return 0.50   # Barely beats treasury
-        if spread >= -0.01:   return 0.25   # Slightly below — borderline
-        return 0.0                          # Below treasury rate — fail
+        if spread >= 0.04:    return 1.0
+        if spread >= 0.02:    return 0.85
+        if spread >= 0.01:    return 0.70
+        if spread >= 0.0:     return 0.50
+        if spread >= -0.01:   return 0.25
+        return 0.0
