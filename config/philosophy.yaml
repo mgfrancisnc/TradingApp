@@ -1,6 +1,24 @@
 # Francis-Hayes Trading Bot — Philosophy Configuration
 # Encoded from Hayes' recording at Anchorage Inn & Marina
-# Strategy: Monthly Call Buying — Weekly Execution When Conditions Are Right
+#
+# Strategy #1 of a planned multi-strategy bot
+# Assignment-Targeting Covered Calls
+# Sell ATM calls on owned shares, hold to expiration, accept assignment as the intended outcome
+# No early closes. No rolls. Assignment is success, not failure.
+#
+# Single source of truth — never hardcode rule values in Python files.
+# All strategy changes go here first.
+
+# ─────────────────────────────────────────────
+# STRATEGY IDENTITY
+# ─────────────────────────────────────────────
+strategy:
+  name: assignment_targeting_covered_calls
+  version: "3.0"
+  description: >
+    Sell covered calls at-the-money on large-cap stocks we already own.
+    Collect premium. Hold to expiration. Accept assignment.
+    Cash returns to pool and deploys into the next cycle.
 
 # ─────────────────────────────────────────────
 # CHART & TREND RULES
@@ -18,97 +36,157 @@ trend:
 # ─────────────────────────────────────────────
 # STOCK CLASSIFICATION
 # "Are you buying growth or income?"
+# For covered calls we lean income — lower beta, stable appreciation
 # ─────────────────────────────────────────────
 stock_types:
   growth:
-    primary_metric: CAGR            # Compounded Annual Growth Rate — #1 metric
+    primary_metric: CAGR
     red_flag: revenue_deceleration  # "Paid for 20%, got 10% — very hard to compound"
     revenue_over_earnings: true     # "You can't lie about revenue"
-    acceptable_beta: ">1.0"         # Higher volatility OK for growth
+    acceptable_beta: ">1.0"
+    covered_call_note: >
+      Use caution — rapid appreciation risks assignment at low strikes before
+      premium justifies the trade. Acceptable but not preferred.
 
   income:
     primary_metric: dividend_yield_vs_treasury
     minimum_yield_above_treasury: true  # "Otherwise just buy treasuries"
     red_flag: yield_below_10yr_treasury
     preferred_beta: "<1.0"          # Lower volatility preferred
-    covered_call_overlay: optional  # e.g. 3% dividend + calls = 7% total yield
+    covered_call_note: >
+      Preferred universe. Stable price appreciation + call premium = predictable yield.
 
 # ─────────────────────────────────────────────
-# FUNDAMENTAL FILTERS
-# "What's the earnings power? Is revenue growing or decelerating?"
+# UNIVERSE FILTERS
+# Large-cap, liquid names only. No small caps, no niche names.
 # ─────────────────────────────────────────────
-fundamentals:
-  revenue_growth_must_be_positive: true
-  revenue_deceleration_max_pct: 50    # Revenue growth can't drop by more than half YoY
-  earnings_power_positive: true
-  familiarity_required: true          # "If you're not familiar with the company — don't touch it"
+universe:
+  market_cap_min_billions: 10       # $10B minimum — large-cap only
+  exchanges:                        # NYSE and NASDAQ only
+    - NYSE
+    - NASDAQ
+  stock_liquidity:
+    avg_daily_volume_min: 1_000_000 # ≥1M shares/day
+  options_liquidity:
+    daily_contract_volume_min: 1000 # ≥1,000 contracts/day on front month
+    open_interest_min: 500          # ≥500 OI at target strikes
+    bid_ask_spread_max_pct: 5.0     # ≤5% of mid-price at target strike
+  baseline: >
+    S&P 100 + select mega-caps + major sector ETFs (~100-150 names total)
 
 # ─────────────────────────────────────────────
-# OPTIONS MARKET SENTIMENT
+# COVERED CALL PARAMETERS
+# ─────────────────────────────────────────────
+covered_call:
+  # Strike selection — ATM, delta-based
+  delta_target: 0.50                # Default target delta (ATM)
+  delta_min: 0.45                   # Acceptable range floor
+  delta_max: 0.55                   # Acceptable range ceiling
+
+  # Expiration
+  expiry_dte_min: 28                # Minimum days to expiration
+  expiry_dte_max: 35                # Maximum days to expiration
+
+  # Coverage rule
+  coverage_pct: 100                 # Every 100-share lot must have a call written
+
+  # Minimum premium quality
+  min_premium_pct_of_stock: 0.5    # Premium must be ≥0.5% of stock price per contract
+
+  # Hold to expiration — no exceptions
+  early_close: false                # Never close early
+  roll_positions: false             # Never roll — let assignment happen
+
+  # Assignment policy
+  assignment_policy: accept         # Assignment is the intended outcome, not a failure
+
+# ─────────────────────────────────────────────
+# HARD RULES (BINARY GATES)
+# If any of these fail, the trade is rejected. No score is computed.
+# ─────────────────────────────────────────────
+hard_rules:
+  monthly_trend_must_be_up: true
+  weekly_trend_must_confirm_monthly: true
+  price_not_breaking_support: true
+  revenue_growth_positive_or_stable: true   # Positive YoY, or no severe deceleration
+  revenue_deceleration_max_pct: 50          # Growth can't drop by more than half YoY
+  put_call_sentiment_not_bearish: true      # 6-12mo put/call must not favor puts
+  portfolio_below_max_positions: true       # Must be under 20-position cap
+  familiarity_required: true               # "If you're not familiar with it — don't touch it"
+  min_shares_owned: 100                    # Must own ≥100 shares before writing a call
+  iv_rank_min: 30                          # IV rank must be >30 to sell premium
+  options_liquidity_gates: true            # Volume, OI, bid-ask must all pass
+  earnings_blackout: hard                  # No calls expiring after an earnings date
+
+# ─────────────────────────────────────────────
+# RISK MANAGEMENT
+# ─────────────────────────────────────────────
+risk:
+  # Position limits
+  max_positions: 20                 # Hard cap — 20 names max
+  target_positions: 10              # Sweet spot for active management
+
+  # Position sizing
+  max_position_size_pct: 5.0        # Never more than 5% of portfolio per name
+
+  # Circuit breaker
+  max_daily_loss_pct: 3.0           # Halt all new positions if portfolio drops ≥3% in one day
+
+  # Assignment handling
+  on_assignment: return_cash_to_pool  # Cash goes back to available pool for next cycle
+
+# ─────────────────────────────────────────────
+# OPTIONS SENTIMENT
 # "Put to call — are more people buying calls or puts?"
 # "Look 6-12 months out, not daily — daily means nothing"
 # ─────────────────────────────────────────────
 options_sentiment:
   lookout_window_months_min: 6
   lookout_window_months_max: 12
-  put_call_bullish_threshold: 1.0     # Calls must outweigh puts (>1.0 = more calls)
-  strong_bullish_threshold: 2.0       # 2:1 calls to puts = "very bullish"
+  put_call_bullish_threshold: 1.0   # Calls must outweigh puts (>1.0 = more calls than puts)
+  strong_bullish_threshold: 2.0     # 2:1 calls to puts = "very bullish"
 
 # ─────────────────────────────────────────────
 # VOLUME
 # "Volume predicts price — the more volume, the more price"
 # ─────────────────────────────────────────────
 volume:
-  trend_must_be_positive: true        # Rising volume confirms rising price
-  use_for_confirmation: true
+  trend_must_be_positive: true      # Rising volume confirms rising price
 
 # ─────────────────────────────────────────────
-# STRIKE SELECTION
-# "No more than 10% OTM"
-# "Can write ATM if S&P trend is downward"
+# FUNDAMENTALS
+# "What's the earnings power? Is revenue growing or decelerating?"
 # ─────────────────────────────────────────────
-strike_selection:
-  max_otm_percent: 10                 # Never buy more than 10% out of the money
-  default_target_otm_percent: 5       # Sweet spot — balance of cost and leverage
-  atm_condition: sp500_monthly_downtrend   # Go ATM when market is heading down
-  expiry_dte_min: 28                  # Minimum days to expiry
-  expiry_dte_max: 35                  # Maximum days to expiry ("a month out")
-
-# ─────────────────────────────────────────────
-# RISK MANAGEMENT
-# ─────────────────────────────────────────────
-risk:
-  # Position sizing
-  max_position_size_pct: 5.0          # Never more than 5% of portfolio per name
-  max_positions: 20                   # Hard cap — 20 names tops
-  target_positions: 10                # Sweet spot for active management
-
-  # Exit rules
-  stop_loss_underlying_pct: 10.0      # Exit call if STOCK drops 10% from entry
-                                      # (watch underlying price, not option premium)
-
-  # Time horizon
-  thesis_horizon_months: 12           # "Typically it's gonna be a year"
+fundamentals:
+  revenue_growth_must_be_positive: true
+  revenue_deceleration_max_pct: 50
+  familiarity_required: true
 
 # ─────────────────────────────────────────────
 # RISK-FREE RATE BENCHMARK
 # "All returns are based on the 10-year treasury"
-# "You have to get above whatever the risk-free rate is"
 # ─────────────────────────────────────────────
 benchmark:
   risk_free_instrument: 10yr_treasury
-  income_stock_min_yield_premium: 0   # Yield must beat treasury — period
-  fetch_live_treasury_rate: true      # Pull current rate dynamically
+  income_stock_min_yield_premium: 0  # Dividend yield must beat treasury — period
+  fetch_live_treasury_rate: true
 
 # ─────────────────────────────────────────────
-# SCORING WEIGHTS
-# Higher weight = more important to Hayes
+# CONVICTION SCORING WEIGHTS
+# Stage 2 — computed only after all hard rules pass
+# Must reach ≥60% to be approved for the scan report
 # ─────────────────────────────────────────────
-scoring_weights:
-  monthly_trend_strength: 0.25        # Most important — monthly dictates direction
-  revenue_growth_cagr: 0.20           # #1 fundamental metric
-  put_call_ratio_skew: 0.15           # Smart money sentiment 6-12mo out
-  volume_trend: 0.15                  # Volume predicts price
-  beta_fit: 0.10                      # Volatility appropriate for strategy
-  yield_vs_risk_free: 0.10            # Income stocks: must beat treasury
-  weekly_trend_confirmation: 0.05     # Secondary — confirms monthly only
+scoring:
+  approval_threshold: 0.60          # Minimum score to appear on approved list
+
+  weights:
+    iv_rank: 0.20                   # Premium quality — are we being paid well to sell?
+    monthly_trend_strength: 0.20    # Monthly chart dictates direction
+    options_liquidity: 0.10         # Can we get filled at a fair price?
+    put_call_ratio: 0.10            # Smart money sentiment 6-12mo out
+    volume_trend: 0.10              # Volume predicts price
+    beta_fit: 0.10                  # Volatility appropriate for covered call writing
+    premium_to_capital_ratio: 0.05  # Annualized yield from this call
+    revenue_cagr_stability: 0.05    # Revenue growing or holding steady
+    yield_vs_risk_free: 0.05        # For income stocks: dividend + premium beats treasury
+    weekly_trend_confirmation: 0.05 # Secondary — confirms monthly only
