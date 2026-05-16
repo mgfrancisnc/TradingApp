@@ -46,10 +46,15 @@ trading_bot/
 ├── execution/
 │   ├── alpaca_client.py          # Alpaca API wrapper (paper/live toggle)
 │   ├── execute.py                # Sell-to-open submission with human confirmation
-│   └── scheduler.py              # Automated Sunday scan + market hour monitoring
-└── scanner/
-    ├── universe.py               # Large-cap screener (≥$10B, NYSE/NASDAQ)
-    └── weekly_scanner.py         # Two jobs: uncovered lots + new candidates
+│   ├── run_logger.py             # Shared run capture → data/run_logs/*.log + *.meta.json
+│   └── scheduler.py              # Automated scan/monitor + PID file + heartbeat
+├── scanner/
+│   ├── universe.py               # Large-cap screener (≥$10B, NYSE/NASDAQ)
+│   └── weekly_scanner.py         # Two jobs: uncovered lots + new candidates
+└── web/
+    ├── app.py                    # Localhost Flask console (run/execute/history/reports)
+    ├── templates/index.html      # Single-page UI
+    └── static/                   # Plain CSS + JS (no framework, no build step)
 ```
 
 ## Weekly Workflow
@@ -69,7 +74,17 @@ python bot.py execute      # Review approved trades, confirm, submit
 python bot.py monitor      # Check DTE and assignments (run every 30min)
 python bot.py schedule     # Run continuous scheduler
 python bot.py status       # Portfolio overview
+python bot.py web          # Localhost web console — 127.0.0.1:8787
 ```
+
+## Web Console (`python bot.py web`)
+- Localhost only (`127.0.0.1`), no auth — never expose the port (can submit real trades)
+- Independent of the scheduler: separate process, communicates via files in `data/`
+- Can start/stop/restart the scheduler (spawns it detached; scheduler owns its own
+  `data/scheduler.pid` and clears it on graceful SIGTERM, so it survives a web restart)
+- Every run (scheduled or manual) is captured to `data/run_logs/` via `run_logger`
+- Execute approval happens in the browser via `TradeExecutor.get_pending_trades()` /
+  `execute_selected()`; the interactive CLI `execute` path is unchanged
 
 ## Data Sources (no paid API keys beyond Alpaca)
 - **Alpaca** — price bars, options chain (delta, IV, OI), order execution
