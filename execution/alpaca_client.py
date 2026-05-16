@@ -167,6 +167,85 @@ class AlpacaClient:
         positions = self._trading.get_all_positions()
         return [p for p in positions if p.asset_class == AssetClass.US_OPTION]
 
+    def get_stock_positions(self) -> list:
+        """Returns all open stock (equity) positions as Alpaca Position objects."""
+        from alpaca.trading.enums import AssetClass
+        positions = self._trading.get_all_positions()
+        return [p for p in positions if p.asset_class == AssetClass.US_EQUITY]
+
+    def get_portfolio_history_today(self) -> Optional[dict]:
+        """
+        Returns today's open and current portfolio value for circuit breaker check.
+        Returns {"open_value": float, "current_value": float} or None.
+        """
+        try:
+            from alpaca.trading.requests import GetPortfolioHistoryRequest
+            req = GetPortfolioHistoryRequest(period="1D", timeframe="1Min")
+            history = self._trading.get_portfolio_history(req)
+            if history and history.equity and len(history.equity) >= 2:
+                open_value = history.equity[0]
+                current_value = history.equity[-1]
+                if open_value and current_value:
+                    return {"open_value": float(open_value), "current_value": float(current_value)}
+        except Exception as e:
+            logger.debug(f"Portfolio history unavailable: {e}")
+        return None
+
+    def get_iv_history(self, symbol: str, days: int = 365) -> Optional[list]:
+        """
+        Returns a list of historical IV estimates for IV rank calculation.
+        Uses yfinance options chain to get current ATM IV, and historical
+        price volatility to approximate the 52-week range.
+        Returns None if data is unavailable.
+        """
+        try:
+            import yfinance as yf
+            import numpy as np
+            ticker = yf.Ticker(symbol)
+
+            # Get current ATM IV from nearest options expiry
+            expirations = ticker.options
+            if not expirations:
+                return None
+
+            chain = ticker.option_chain(expirations[0])
+            calls = chain.calls
+            if calls.empty:
+                return None
+
+            # Get current stock price
+            info = ticker.fast_info
+            current_price = getattr(info, "last_price", None) or getattr(info, "previous_close", None)
+            if not current_price:
+                return None
+
+            # Find ATM call IV
+            calls["distance"] = abs(calls["strike"] - current_price)
+            atm = calls.nsmallest(3, "distance")
+            current_iv = atm["impliedVolatility"].mean()
+            if not current_iv or current_iv <= 0:
+                return None
+
+            # Use 1-year historical price data to estimate IV range
+            hist = ticker.history(period="1y")
+            if hist.empty or len(hist) < 20:
+                return [current_iv]
+
+            # Rolling 30-day annualised volatility as IV proxy
+            log_returns = np.log(hist["Close"] / hist["Close"].shift(1)).dropna()
+            rolling_vol = log_returns.rolling(30).std() * (252 ** 0.5)
+            vol_series = rolling_vol.dropna().tolist()
+
+            if not vol_series:
+                return [current_iv]
+
+            # Blend current option IV with historical vol series
+            return vol_series + [current_iv]
+
+        except Exception as e:
+            logger.debug(f"{symbol}: IV history unavailable — {e}")
+            return None
+
     def get_latest_stock_price(self, symbol: str) -> Optional[float]:
         """Returns the most recent trade price for a stock."""
         try:
@@ -307,6 +386,50 @@ class AlpacaClient:
                 symbol=option_symbol,
                 qty=contracts,
                 side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+            )
+
+        order = self._trading.submit_order(req)
+        logger.info(f"Order accepted: {order.id}  status={order.status}")
+        return order
+
+    def sell_call(
+        self,
+        symbol: str,
+        expiry: str,
+        strike: float,
+        contracts: int,
+        order_type: str = "limit",
+        limit_price: float = None,
+    ):
+        """
+        Submits a sell-to-open limit order for a covered call.
+        This is the primary order type for the assignment-targeting strategy.
+        Returns the Alpaca order object.
+        """
+        from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce
+
+        option_symbol = _build_occ(symbol, expiry, "call", strike)
+        logger.info(
+            f"{'PAPER ' if self._paper else ''}ORDER: SELL {contracts}x {option_symbol} "
+            f"@ {'$' + str(round(limit_price, 2)) if limit_price else 'MKT'}"
+        )
+
+        if order_type == "limit" and limit_price:
+            req = LimitOrderRequest(
+                symbol=option_symbol,
+                qty=contracts,
+                side=OrderSide.SELL,
+                type="limit",
+                time_in_force=TimeInForce.DAY,
+                limit_price=round(limit_price, 2),
+            )
+        else:
+            req = MarketOrderRequest(
+                symbol=option_symbol,
+                qty=contracts,
+                side=OrderSide.SELL,
                 time_in_force=TimeInForce.DAY,
             )
 

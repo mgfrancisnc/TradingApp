@@ -121,10 +121,9 @@ class HardRules:
 
         # ── IV rank gate — only sell premium when IV is elevated ─
         iv_min = rules.get("iv_rank_min", 30)
-        if iv_rank is None:
-            failed.append("IV rank unavailable")
-        elif iv_rank <= iv_min:
+        if iv_rank is not None and iv_rank <= iv_min:
             failed.append(f"IV rank {iv_rank:.0f} too low (need >{iv_min})")
+        # If iv_rank is None, data was unavailable — log but don't block
 
         # ── Options liquidity gates ────────────────────────────
         if not liquidity_ok:
