@@ -3,15 +3,16 @@ options_chain.py
 Options chain analysis for the Francis-Hayes Trading Bot.
 
 Pulls live options data via Alpaca, computes:
-  - Put/call ratio 6-12 months out (Hayes' sentiment measure)
-  - Recommended strike (5% OTM default, ATM when S&P is downtrending)
-  - Expiry selection (28-35 DTE)
-  - Contracts affordable at ≤5% of portfolio per position
+  - ATM strike selection via delta (target 0.50, range 0.45-0.55)
+  - IV rank (current IV vs 52-week range) — must be >30 to sell premium
+  - Liquidity gate checks (volume, OI, bid-ask spread)
+  - Put/call sentiment ratio (6-12 months out)
+  - Contracts to write = shares_owned // 100 (100% coverage rule)
 
-Hayes' rules:
-  'Put to call — are more people buying calls or puts? Look 6-12 months out.'
-  'No more than 10% OTM. Can write ATM if S&P trend is downward.'
+Hayes' rules encoded here:
+  'Put to call — look 6-12 months out. Daily means nothing.'
   'Expiry: a month out — 28 to 35 days.'
+  Assignment-targeting strategy: we sell ATM (0.50 delta), hold to expiration.
 """
 
 import logging
@@ -29,21 +30,33 @@ SENTIMENT_NEUTRAL = "neutral"
 @dataclass
 class OptionsAnalysis:
     symbol: str
-    put_call_ratio: float           # calls / puts by open interest (>1.0 = more calls)
-    sentiment: str                  # 'bullish', 'bearish', 'neutral'
-    sentiment_score: float          # 0.0 – 1.0 for scoring
+    # Strike selection
     recommended_strike: Optional[float]
-    recommended_expiry: Optional[str]       # "YYYY-MM-DD"
-    strike_type: Optional[str]             # "OTM" or "ATM"
-    otm_percent: Optional[float]            # % out of the money
-    estimated_premium: Optional[float]     # per-contract mid price (not × 100)
-    contracts_affordable: Optional[int]    # contracts within 5% portfolio cap
+    recommended_expiry: Optional[str]   # "YYYY-MM-DD"
+    delta: Optional[float]              # Delta of selected strike (target ~0.50)
+    estimated_premium: Optional[float]  # Per-share mid price (multiply by 100 for contract value)
+    contracts_to_write: Optional[int]   # shares_owned // 100
+    # IV rank
+    iv_rank: Optional[float]            # 0-100; must be >30 per hard rules
+    iv_rank_passes: Optional[bool]
+    # Liquidity gates
+    liquidity_ok: Optional[bool]
+    daily_volume: Optional[int]
+    open_interest: Optional[int]
+    bid_ask_spread_pct: Optional[float]
+    # Sentiment
+    put_call_ratio: float               # calls / puts OI (>1.0 = more calls)
+    sentiment: str
+    sentiment_score: float              # 0.0-1.0 for scoring
+    # Premium quality
+    premium_to_stock_pct: Optional[float]  # Premium as % of stock price
+    premium_passes_min: Optional[bool]     # Must be ≥0.5% per philosophy
 
 
 class OptionsChainAnalyzer:
     """
-    Uses Alpaca options data to compute sentiment and select strikes.
-    Falls back gracefully when data is unavailable (e.g. paper account limits).
+    Uses Alpaca options data to select ATM strikes and validate trade quality.
+    Falls back gracefully when live data is unavailable (e.g. paper account limits).
     """
 
     def __init__(self, alpaca_client, philosophy: dict):
@@ -54,49 +67,76 @@ class OptionsChainAnalyzer:
         self,
         symbol: str,
         current_price: float,
-        sp500_trend: str,
-        portfolio_value: float,
+        shares_owned: int,
     ) -> Optional[OptionsAnalysis]:
         """
         Full options analysis for one symbol.
+        shares_owned determines how many contracts can be written (100% coverage rule).
         Returns None if no options data is available.
         """
         try:
-            # 1. Put/call sentiment (6-12 months out)
             ratio, sentiment, sentiment_score = self._put_call_ratio(symbol)
-
-            # 2. Strike + expiry selection (28-35 DTE)
-            strike_info = self._select_strike(symbol, current_price, sp500_trend)
+            strike_info = self._select_strike(symbol, current_price, shares_owned)
 
             if not strike_info:
-                # Still return sentiment even without a strike
                 return OptionsAnalysis(
                     symbol=symbol,
+                    recommended_strike=None,
+                    recommended_expiry=None,
+                    delta=None,
+                    estimated_premium=None,
+                    contracts_to_write=None,
+                    iv_rank=None,
+                    iv_rank_passes=None,
+                    liquidity_ok=None,
+                    daily_volume=None,
+                    open_interest=None,
+                    bid_ask_spread_pct=None,
                     put_call_ratio=ratio,
                     sentiment=sentiment,
                     sentiment_score=sentiment_score,
-                    recommended_strike=None,
-                    recommended_expiry=None,
-                    strike_type=None,
-                    otm_percent=None,
-                    estimated_premium=None,
-                    contracts_affordable=None,
+                    premium_to_stock_pct=None,
+                    premium_passes_min=None,
                 )
 
-            strike, expiry, strike_type, otm_pct, premium = strike_info
-            contracts = self._contracts_affordable(portfolio_value, premium)
+            iv_rank = self._iv_rank(symbol)
+            iv_min = self.phil.get("hard_rules", {}).get("iv_rank_min", 30)
+            iv_rank_passes = iv_rank is not None and iv_rank > iv_min
+
+            (
+                strike, expiry, delta, premium,
+                daily_vol, oi, spread_pct, liquidity_ok
+            ) = strike_info
+
+            contracts_to_write = shares_owned // 100
+
+            min_premium_pct = (
+                self.phil.get("covered_call", {}).get("min_premium_pct_of_stock", 0.5)
+            )
+            premium_to_stock_pct = (premium / current_price * 100) if current_price else None
+            premium_passes_min = (
+                premium_to_stock_pct is not None
+                and premium_to_stock_pct >= min_premium_pct
+            )
 
             return OptionsAnalysis(
                 symbol=symbol,
+                recommended_strike=strike,
+                recommended_expiry=expiry,
+                delta=delta,
+                estimated_premium=premium,
+                contracts_to_write=contracts_to_write,
+                iv_rank=iv_rank,
+                iv_rank_passes=iv_rank_passes,
+                liquidity_ok=liquidity_ok,
+                daily_volume=daily_vol,
+                open_interest=oi,
+                bid_ask_spread_pct=spread_pct,
                 put_call_ratio=ratio,
                 sentiment=sentiment,
                 sentiment_score=sentiment_score,
-                recommended_strike=strike,
-                recommended_expiry=expiry,
-                strike_type=strike_type,
-                otm_percent=otm_pct,
-                estimated_premium=premium,
-                contracts_affordable=contracts,
+                premium_to_stock_pct=round(premium_to_stock_pct, 3) if premium_to_stock_pct else None,
+                premium_passes_min=premium_passes_min,
             )
 
         except Exception as e:
@@ -104,7 +144,168 @@ class OptionsChainAnalyzer:
             return None
 
     # ─────────────────────────────────────────────
-    # PUT/CALL RATIO
+    # STRIKE SELECTION — DELTA BASED
+    # ─────────────────────────────────────────────
+
+    def _select_strike(
+        self,
+        symbol: str,
+        current_price: float,
+        shares_owned: int,
+    ) -> Optional[tuple]:
+        """
+        Finds the call closest to 0.50 delta in the 28-35 DTE window.
+        Validates liquidity gates before returning.
+
+        Returns (strike, expiry, delta, premium, daily_vol, oi, spread_pct, liquidity_ok)
+        or None if no chain data available.
+        """
+        cc = self.phil.get("covered_call", {})
+        delta_target = cc.get("delta_target", 0.50)
+        delta_min = cc.get("delta_min", 0.45)
+        delta_max = cc.get("delta_max", 0.55)
+        dte_min = cc.get("expiry_dte_min", 28)
+        dte_max = cc.get("expiry_dte_max", 35)
+
+        chain = self.client.get_options_chain(symbol, dte_min=dte_min, dte_max=dte_max)
+
+        if not chain:
+            return self._synthetic_strike(current_price, delta_target, dte_min, dte_max)
+
+        # Filter to calls with delta data and valid pricing
+        calls = [
+            c for c in chain
+            if c.type == "call"
+            and c.delta is not None
+            and delta_min <= c.delta <= delta_max
+            and c.bid_price is not None
+            and c.ask_price is not None
+            and c.bid_price > 0
+        ]
+
+        if not calls:
+            # Widen to any call with delta data and pick closest to target
+            calls = [
+                c for c in chain
+                if c.type == "call"
+                and c.delta is not None
+                and c.bid_price is not None
+                and c.ask_price is not None
+                and c.bid_price > 0
+            ]
+            if not calls:
+                return self._synthetic_strike(current_price, delta_target, dte_min, dte_max)
+
+        best = min(calls, key=lambda c: abs(c.delta - delta_target))
+        mid_price = (best.bid_price + best.ask_price) / 2
+        spread_pct = (
+            (best.ask_price - best.bid_price) / mid_price * 100
+            if mid_price > 0 else 999.0
+        )
+
+        daily_vol = getattr(best, "volume", None) or 0
+        oi = getattr(best, "open_interest", None) or 0
+        liquidity_ok = self._check_liquidity(daily_vol, oi, spread_pct)
+
+        logger.debug(
+            f"{symbol}: selected strike ${best.strike_price} "
+            f"delta={best.delta:.2f} premium=${mid_price:.2f} "
+            f"vol={daily_vol} oi={oi} spread={spread_pct:.1f}%"
+        )
+
+        return (
+            best.strike_price,
+            best.expiry,
+            round(best.delta, 3),
+            round(mid_price, 2),
+            daily_vol,
+            oi,
+            round(spread_pct, 1),
+            liquidity_ok,
+        )
+
+    def _check_liquidity(self, daily_vol: int, oi: int, spread_pct: float) -> bool:
+        """
+        Validates options liquidity gates from philosophy.yaml.
+        All three must pass for the trade to proceed.
+        """
+        u = self.phil.get("universe", {}).get("options_liquidity", {})
+        vol_min = u.get("daily_contract_volume_min", 1000)
+        oi_min = u.get("open_interest_min", 500)
+        spread_max = u.get("bid_ask_spread_max_pct", 5.0)
+
+        vol_ok = daily_vol >= vol_min
+        oi_ok = oi >= oi_min
+        spread_ok = spread_pct <= spread_max
+
+        if not (vol_ok and oi_ok and spread_ok):
+            logger.debug(
+                f"Liquidity gate failed: vol={daily_vol}(min {vol_min}) "
+                f"oi={oi}(min {oi_min}) spread={spread_pct:.1f}%(max {spread_max})"
+            )
+
+        return vol_ok and oi_ok and spread_ok
+
+    def _synthetic_strike(
+        self,
+        current_price: float,
+        delta_target: float,
+        dte_min: int,
+        dte_max: int,
+    ) -> Optional[tuple]:
+        """
+        When no live chain is available, synthesizes a reasonable ATM estimate.
+        Premium approximated as ~2% of stock price for a 30-DTE ATM call.
+        Liquidity cannot be verified — gates marked as failed.
+        """
+        strike = round(current_price / 2.5) * 2.5  # round to nearest $2.50
+        mid_dte = (dte_min + dte_max) / 2
+        expiry = (datetime.now() + timedelta(days=mid_dte)).strftime("%Y-%m-%d")
+        premium = round(current_price * 0.02, 2)
+        premium = max(0.10, premium)
+
+        logger.debug(
+            f"Using synthetic ATM estimate: ${strike} premium=${premium} "
+            f"(no live chain — liquidity unverified)"
+        )
+        # daily_vol=0, oi=0, spread_pct=999 → liquidity_ok=False
+        return (strike, expiry, delta_target, premium, 0, 0, 999.0, False)
+
+    # ─────────────────────────────────────────────
+    # IV RANK
+    # ─────────────────────────────────────────────
+
+    def _iv_rank(self, symbol: str) -> Optional[float]:
+        """
+        Computes IV rank: where current IV sits within its 52-week range.
+        IV rank = (current_IV - 52wk_low) / (52wk_high - 52wk_low) * 100
+
+        Hard rule: must be >30 to sell premium. Low IV rank means we are
+        collecting below-average premium for the risk taken.
+        """
+        try:
+            iv_data = self.client.get_iv_history(symbol, days=365)
+            if not iv_data or len(iv_data) < 20:
+                logger.debug(f"{symbol}: insufficient IV history, skipping IV rank")
+                return None
+
+            current_iv = iv_data[-1]
+            iv_low = min(iv_data)
+            iv_high = max(iv_data)
+
+            if iv_high == iv_low:
+                return 50.0  # flat IV history — treat as middle of range
+
+            rank = (current_iv - iv_low) / (iv_high - iv_low) * 100
+            logger.debug(f"{symbol}: IV rank {rank:.1f} (current={current_iv:.3f} lo={iv_low:.3f} hi={iv_high:.3f})")
+            return round(rank, 1)
+
+        except Exception as e:
+            logger.debug(f"{symbol}: IV rank calculation failed — {e}")
+            return None
+
+    # ─────────────────────────────────────────────
+    # PUT/CALL SENTIMENT
     # ─────────────────────────────────────────────
 
     def _put_call_ratio(self, symbol: str) -> tuple[float, str, float]:
@@ -123,7 +324,6 @@ class OptionsChainAnalyzer:
         )
 
         if not contracts:
-            # No data available — return neutral
             logger.debug(f"{symbol}: no long-dated options data, defaulting to neutral")
             return 1.0, SENTIMENT_NEUTRAL, 0.4
 
@@ -136,19 +336,13 @@ class OptionsChainAnalyzer:
         if put_oi == 0 and call_oi == 0:
             return 1.0, SENTIMENT_NEUTRAL, 0.4
 
-        if put_oi == 0:
-            ratio = float("inf")
-        else:
-            ratio = call_oi / put_oi
+        ratio = float("inf") if put_oi == 0 else call_oi / put_oi
 
-        # Classify
         if ratio >= strong_threshold:
             sentiment = SENTIMENT_BULLISH
-            # Score: linearly scale 0.7→1.0 between strong_threshold and 3.0
             score = min(1.0, 0.7 + (ratio - strong_threshold) / (3.0 - strong_threshold) * 0.3)
         elif ratio >= bullish_threshold:
             sentiment = SENTIMENT_BULLISH
-            # Score: 0.55→0.70 between threshold and strong_threshold
             score = 0.55 + (ratio - bullish_threshold) / (strong_threshold - bullish_threshold) * 0.15
         elif ratio >= 0.7:
             sentiment = SENTIMENT_NEUTRAL
@@ -159,127 +353,3 @@ class OptionsChainAnalyzer:
 
         logger.debug(f"{symbol}: P/C ratio {ratio:.2f} calls:{call_oi} puts:{put_oi} → {sentiment}")
         return round(ratio, 2), sentiment, round(score, 3)
-
-    # ─────────────────────────────────────────────
-    # STRIKE SELECTION
-    # ─────────────────────────────────────────────
-
-    def _select_strike(
-        self,
-        symbol: str,
-        current_price: float,
-        sp500_trend: str,
-    ) -> Optional[tuple]:
-        """
-        Selects the best strike and expiry from the near-term chain (28-35 DTE).
-
-        Returns (strike, expiry, strike_type, otm_pct, estimated_premium)
-        or None if no suitable options found.
-        """
-        phil_strike = self.phil.get("strike_selection", {})
-        max_otm = phil_strike.get("max_otm_percent", 10.0)
-        target_otm = phil_strike.get("default_target_otm_percent", 5.0)
-        atm_condition = phil_strike.get("atm_condition", "sp500_monthly_downtrend")
-        dte_min = phil_strike.get("expiry_dte_min", 28)
-        dte_max = phil_strike.get("expiry_dte_max", 35)
-
-        # When S&P is downtrending, go ATM
-        use_atm = sp500_trend == "bearish" and atm_condition == "sp500_monthly_downtrend"
-        if use_atm:
-            target_otm_pct = 0.0
-            strike_type = "ATM"
-        else:
-            target_otm_pct = target_otm / 100.0
-            strike_type = "OTM"
-
-        max_otm_pct = max_otm / 100.0
-        target_strike = current_price * (1 + target_otm_pct)
-        max_strike = current_price * (1 + max_otm_pct)
-
-        # Fetch the near-term chain
-        chain = self.client.get_options_chain(symbol, dte_min=dte_min, dte_max=dte_max)
-
-        if not chain:
-            # Fall back to synthetic estimate
-            return self._synthetic_strike(
-                current_price, target_otm_pct, max_otm_pct,
-                dte_min, dte_max, strike_type
-            )
-
-        # Filter to valid calls with pricing data
-        valid = [
-            c for c in chain
-            if c.type == "call"
-            and c.strike_price <= max_strike
-            and c.bid_price is not None
-            and c.ask_price is not None
-            and c.bid_price > 0
-        ]
-
-        if not valid:
-            return self._synthetic_strike(
-                current_price, target_otm_pct, max_otm_pct,
-                dte_min, dte_max, strike_type
-            )
-
-        # Find the strike closest to target
-        best = min(valid, key=lambda c: abs(c.strike_price - target_strike))
-        mid_price = (best.bid_price + best.ask_price) / 2
-        actual_otm = (best.strike_price - current_price) / current_price * 100
-
-        return (
-            best.strike_price,
-            best.expiry,
-            strike_type,
-            round(actual_otm, 1),
-            round(mid_price, 2),
-        )
-
-    def _synthetic_strike(
-        self,
-        current_price: float,
-        target_otm_pct: float,
-        max_otm_pct: float,
-        dte_min: int,
-        dte_max: int,
-        strike_type: str,
-    ) -> Optional[tuple]:
-        """
-        When no live chain is available, synthesize a reasonable estimate.
-        Premium is approximated as ~2-4% of strike for a 30-DTE call.
-        """
-        strike = round(current_price * (1 + target_otm_pct) / 2.5) * 2.5  # round to nearest 2.50
-        otm_pct = (strike - current_price) / current_price * 100
-        mid_dte = (dte_min + dte_max) / 2
-        expiry = (datetime.now() + timedelta(days=mid_dte)).strftime("%Y-%m-%d")
-        # Rough premium estimate: ~2% of stock price for near-ATM 30-DTE call
-        premium = round(current_price * 0.02 * (1 - target_otm_pct * 3), 2)
-        premium = max(0.10, premium)  # floor
-
-        logger.debug(f"Using synthetic strike estimate: ${strike} ({otm_pct:.1f}% OTM)")
-        return (strike, expiry, strike_type, round(otm_pct, 1), premium)
-
-    # ─────────────────────────────────────────────
-    # POSITION SIZING
-    # ─────────────────────────────────────────────
-
-    def _contracts_affordable(
-        self,
-        portfolio_value: float,
-        premium_per_contract: float,
-    ) -> int:
-        """
-        Calculates how many contracts fit within the 5% position size limit.
-        Each contract controls 100 shares.
-
-        Hayes: 'Never more than 5% of portfolio per name.'
-        """
-        if not premium_per_contract or premium_per_contract <= 0:
-            return 1
-
-        max_pct = self.phil.get("risk", {}).get("max_position_size_pct", 5.0) / 100.0
-        max_dollars = portfolio_value * max_pct
-        cost_per_contract = premium_per_contract * 100  # 1 contract = 100 shares
-
-        contracts = int(max_dollars / cost_per_contract)
-        return max(1, contracts)  # Always at least 1 if affordable
