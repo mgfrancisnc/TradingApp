@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Francis-Hayes Bot Console</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <div class="brand">Francis-Hayes Bot <span class="sub">console</span></div>
+    <div class="header-right">
+      <span id="mode-badge" class="badge">…</span>
+      <span id="sched-pill" class="pill pill-unknown">scheduler: …</span>
+      <span id="clock" class="clock"></span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="sidebar">
+      <button class="nav-item active" data-view="dashboard">Dashboard</button>
+      <button class="nav-item" data-view="run">Run</button>
+      <button class="nav-item" data-view="execute">Execute</button>
+      <button class="nav-item" data-view="history">History</button>
+      <button class="nav-item" data-view="reports">Reports</button>
+    </nav>
+
+    <main>
+      <!-- DASHBOARD -->
+      <section id="view-dashboard" class="view active">
+        <h2>Scheduler</h2>
+        <div class="card">
+          <div id="sched-detail" class="muted">Loading…</div>
+          <div class="btn-row">
+            <button id="sched-start" class="btn">Start</button>
+            <button id="sched-stop" class="btn btn-danger">Stop</button>
+            <button id="sched-restart" class="btn">Restart</button>
+          </div>
+          <div id="sched-upcoming"></div>
+        </div>
+
+        <h2>Portfolio</h2>
+        <div class="card">
+          <button id="status-refresh" class="btn">Refresh status</button>
+          <div id="status-body" class="muted">Not loaded.</div>
+        </div>
+      </section>
+
+      <!-- RUN -->
+      <section id="view-run" class="view">
+        <h2>Run a command</h2>
+        <div class="btn-row">
+          <button class="btn run-btn" data-cmd="scan">Scan</button>
+          <button class="btn run-btn" data-cmd="monitor">Monitor</button>
+          <button class="btn run-btn" data-cmd="status">Status</button>
+          <span id="run-state" class="muted"></span>
+        </div>
+        <pre id="terminal" class="terminal"></pre>
+      </section>
+
+      <!-- EXECUTE -->
+      <section id="view-execute" class="view">
+        <h2>Execute trades</h2>
+        <p class="muted">Submits real sell-to-open orders to Alpaca. Review carefully.</p>
+        <button id="exec-load" class="btn">Load pending trades</button>
+        <div id="exec-notices"></div>
+        <div id="exec-summary" class="muted"></div>
+        <div id="exec-trades"></div>
+        <div class="btn-row">
+          <button id="exec-submit" class="btn btn-danger" disabled>Submit selected</button>
+        </div>
+        <pre id="exec-output" class="terminal" hidden></pre>
+      </section>
+
+      <!-- HISTORY -->
+      <section id="view-history" class="view">
+        <h2>Run history</h2>
+        <div class="split">
+          <ul id="run-list" class="list"></ul>
+          <pre id="run-detail" class="terminal">Select a run.</pre>
+        </div>
+      </section>
+
+      <!-- REPORTS -->
+      <section id="view-reports" class="view">
+        <h2>Scan reports</h2>
+        <div class="split">
+          <ul id="report-list" class="list"></ul>
+          <pre id="report-detail" class="terminal">Select a report.</pre>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

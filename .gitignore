@@ -20,6 +20,9 @@ venv/
 data/*.json
 data/*.csv
 data/reports/
+data/run_logs/
+data/scheduler_state.json
+data/scheduler.pid
 *.log
 logs/
 

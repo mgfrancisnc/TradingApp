@@ -14,3 +14,6 @@ tradingview-screener>=3.0.0
 # Config & utilities
 pyyaml>=6.0
 requests>=2.31.0
+
+# Web console — localhost-only UI (python bot.py web)
+flask>=3.0.0

@@ -7,6 +7,7 @@ Run modes:
   python bot.py schedule         — Run continuous scheduler
   python bot.py schedule --cron  — Print cron job entries
   python bot.py status           — Show portfolio status
+  python bot.py web              — Localhost web console (127.0.0.1:8787)
 """
 
 import os
@@ -202,9 +203,14 @@ def main():
         cmd_schedule()
         return
 
+    if mode == "web":
+        from web.app import main as web_main
+        web_main()
+        return
+
     if mode not in commands:
         print(f"\n  Unknown command '{mode}'.")
-        print("  Usage: python bot.py [scan | execute | monitor | schedule | status]\n")
+        print("  Usage: python bot.py [scan | execute | monitor | schedule | status | web]\n")
         sys.exit(1)
 
     components = build_components(philosophy)

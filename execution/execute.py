@@ -62,38 +62,15 @@ class TradeExecutor:
 
     def run(self, scan_results: list = None):
         """
-        Main execute flow. Loads approved trades from scan or disk,
-        presents them for confirmation, then submits to Alpaca.
+        Main execute flow (terminal). Loads approved trades, presents them
+        for confirmation via stdin, then submits to Alpaca.
         """
-        if not self.client.is_market_open():
-            print("\n  Market is currently closed.")
-            print("  Orders can only be submitted during market hours (9:30am-4pm ET).")
-            print("  You can review trades now — submit when market opens.\n")
-
-        # Load trades
-        if scan_results:
-            approved = [r for r in scan_results if r.approved]
-            trades = self._scan_results_to_trades(approved)
-        else:
-            trades = self._load_saved_trades()
+        trades, open_positions, notices = self._prepare_trades(scan_results)
+        for n in notices:
+            print(f"\n  {n}")
 
         if not trades:
-            print("\n  No approved trades found.")
-            print("  Run 'python bot.py scan' first to generate candidates.\n")
             return
-
-        # Check position limit
-        open_positions = self.client.get_open_option_positions()
-        remaining_slots = self.phil["risk"]["max_positions"] - len(open_positions)
-
-        if remaining_slots <= 0:
-            print(f"\n  Portfolio is at the {self.phil['risk']['max_positions']}-position limit. No new trades possible.\n")
-            return
-
-        if len(trades) > remaining_slots:
-            print(f"\n  {len(trades)} trades approved but only {remaining_slots} slot(s) available.")
-            print(f"  Showing top {remaining_slots} by score.\n")
-            trades = trades[:remaining_slots]
 
         self._print_trade_review(trades, open_positions)
         confirmed = self._get_confirmation(trades)
@@ -103,6 +80,88 @@ class TradeExecutor:
             return
 
         self._execute_trades(confirmed)
+
+    # ─────────────────────────────────────────────
+    # SHARED PREP (terminal + web)
+    # ─────────────────────────────────────────────
+
+    def _prepare_trades(self, scan_results: list = None):
+        """
+        Load approved trades and apply the position-limit cap.
+        Returns (trades, open_positions, notices) — notices are
+        human-readable strings explaining market/limit state.
+        """
+        notices: list[str] = []
+        if not self.client.is_market_open():
+            notices.append(
+                "Market is currently closed. Orders can only be submitted during "
+                "market hours (9:30am-4pm ET). You can review now and submit later."
+            )
+
+        if scan_results:
+            approved = [r for r in scan_results if r.approved]
+            trades = self._scan_results_to_trades(approved)
+        else:
+            trades = self._load_saved_trades()
+
+        if not trades:
+            notices.append(
+                "No approved trades found. Run a scan first to generate candidates."
+            )
+            return [], [], notices
+
+        open_positions = self.client.get_open_option_positions()
+        max_positions = self.phil["risk"]["max_positions"]
+        remaining_slots = max_positions - len(open_positions)
+
+        if remaining_slots <= 0:
+            notices.append(
+                f"Portfolio is at the {max_positions}-position limit. "
+                f"No new trades possible."
+            )
+            return [], open_positions, notices
+
+        if len(trades) > remaining_slots:
+            notices.append(
+                f"{len(trades)} trades approved but only {remaining_slots} slot(s) "
+                f"available. Showing top {remaining_slots} by score."
+            )
+            trades = trades[:remaining_slots]
+
+        return trades, open_positions, notices
+
+    # ─────────────────────────────────────────────
+    # WEB API (non-interactive — approval happens in the browser)
+    # ─────────────────────────────────────────────
+
+    def get_pending_trades(self) -> dict:
+        """Approved trades ready for browser review, plus context."""
+        trades, open_positions, notices = self._prepare_trades()
+        return {
+            "trades": [asdict(t) for t in trades],
+            "notices": notices,
+            "open_positions": len(open_positions),
+            "max_positions": self.phil["risk"]["max_positions"],
+            "portfolio_value": (
+                self.client.get_portfolio_value() if trades else 0.0
+            ),
+            "total_premium": sum(t.premium_total for t in trades),
+        }
+
+    def execute_selected(self, symbols: list[str]) -> dict:
+        """
+        Submit sell-to-open orders for the chosen symbols. This is the
+        human-in-the-loop confirmation point — the caller (web UI) has
+        already collected explicit approval.
+        """
+        wanted = set(symbols)
+        chosen = [t for t in self._load_saved_trades() if t.symbol in wanted]
+        if not chosen:
+            print("\n  No matching approved trades to submit.\n")
+            return {"succeeded": [], "failed": []}
+
+        succeeded, failed = self._execute_trades(chosen)
+        return {"succeeded": succeeded, "failed": failed}
 
     # ─────────────────────────────────────────────
     # DISPLAY
@@ -180,7 +239,7 @@ class TradeExecutor:
     # EXECUTION
     # ─────────────────────────────────────────────
 
-    def _execute_trades(self, trades: list[ApprovedTrade]):
+    def _execute_trades(self, trades: list[ApprovedTrade]) -> tuple[list, list]:
         print()
         succeeded = []
         failed = []
@@ -245,6 +304,8 @@ class TradeExecutor:
         print(f"\n  Positions registered for DTE monitoring.")
         print(f"  Run 'python bot.py monitor' during market hours to track positions.")
         print("=" * 65 + "\n")
+
+        return succeeded, failed
 
     # ─────────────────────────────────────────────
     # HELPERS
