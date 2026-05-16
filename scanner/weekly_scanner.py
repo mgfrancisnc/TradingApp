@@ -1,31 +1,20 @@
 """
-weekly_scanner.py
+scanner/weekly_scanner.py
+The discovery engine for the Francis-Hayes Trading Bot.
+
 Runs every Sunday evening / Monday pre-market.
 Scans a universe of stocks, scores them against Hayes' philosophy,
-and produces a ranked shortlist report for human review before execution.
+and produces a ranked shortlist report for human review.
 
 'Most buying occurs Friday afternoons and Monday mornings.'
 """
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
-import logging
 
 logger = logging.getLogger(__name__)
-
-# Default universe — expand as you learn more names
-# Hayes: 'If you're not familiar with the company, don't touch it'
-# Start with names you know, add gradually
-DEFAULT_UNIVERSE = [
-    # Large cap growth
-    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA",
-    # Quality growth
-    "CRM", "NOW", "SNOW", "DDOG", "CRWD", "NET",
-    # Income / dividend growth
-    "KO", "JNJ", "PG", "V", "MA", "BRK.B",
-    # Add your own as Hayes identifies them
-]
 
 
 @dataclass
@@ -44,10 +33,10 @@ class ScanResult:
     strike_type: Optional[str]
     otm_pct: Optional[float]
     contracts: Optional[int]
-    estimated_cost: Optional[float]     # Total cost in USD
+    estimated_cost: Optional[float]     # Total cost in USD (premium × 100 × contracts)
     failed_rules: list[str]
     score_breakdown: dict
-    company_brief: str                  # For unfamiliar names
+    company_brief: str                  # One-liner for the report
 
 
 class WeeklyScanner:
@@ -56,8 +45,16 @@ class WeeklyScanner:
     Produces a ranked report for human review before any trade is placed.
     """
 
-    def __init__(self, alpaca_client, market_analyzer, options_analyzer,
-                 hard_rules, scorer, fundamentals_fetcher, philosophy):
+    def __init__(
+        self,
+        alpaca_client,
+        market_analyzer,
+        options_analyzer,
+        hard_rules,
+        scorer,
+        fundamentals_fetcher,
+        philosophy: dict,
+    ):
         self.client = alpaca_client
         self.market = market_analyzer
         self.options = options_analyzer
@@ -66,32 +63,35 @@ class WeeklyScanner:
         self.fundamentals = fundamentals_fetcher
         self.phil = philosophy
 
+    # ─────────────────────────────────────────────
+    # MAIN ENTRY POINT
+    # ─────────────────────────────────────────────
+
     def run(self, universe: list[str] = None) -> list[ScanResult]:
         """
-        Scans the universe, returns ranked list of candidates.
-        Only approved trades (passed rules + score >= 60%) appear at top.
+        Scans the universe, returns a ranked list of candidates.
+        Approved trades (passed rules + score ≥ 60%) appear first.
         """
         if universe is None:
-            universe = DEFAULT_UNIVERSE
+            universe = self._build_universe()
 
-        # Check portfolio state
+        # Portfolio state
         portfolio_value = self.client.get_portfolio_value()
         open_positions = self.client.get_open_option_positions()
         max_positions = self.phil["risk"]["max_positions"]
         max_reached = len(open_positions) >= max_positions
         open_symbols = {p.symbol for p in open_positions}
 
-        # Get market context once — used for all symbols
+        # Market context — fetched once for all symbols
         sp500_trend = self.market.get_sp500_trend()
         treasury_rate = self.fundamentals.get_treasury_rate()
 
-        results = []
         logger.info(f"Scanning {len(universe)} symbols... S&P trend: {sp500_trend}")
+        results = []
 
         for symbol in universe:
-            # Skip if already in portfolio
             if symbol in open_symbols:
-                logger.info(f"{symbol}: Already in portfolio, skipping")
+                logger.debug(f"{symbol}: already in portfolio, skipping")
                 continue
 
             try:
@@ -107,13 +107,48 @@ class WeeklyScanner:
 
             except Exception as e:
                 logger.error(f"Error scanning {symbol}: {e}")
-                continue
 
-        # Sort: approved first, then by score descending
+        # Sort: approved first, then by score
         results.sort(key=lambda r: (not r.approved, -r.score))
 
         self._print_report(results, sp500_trend, portfolio_value, open_positions)
         return results
+
+    # ─────────────────────────────────────────────
+    # UNIVERSE BUILDING
+    # ─────────────────────────────────────────────
+
+    def _build_universe(self) -> list[str]:
+        """
+        Uses TradingView screener to discover candidates dynamically.
+        Falls back to a curated static list if the screener is unavailable.
+        Hayes: 'Advice on stocks we may not be watching.'
+        """
+        try:
+            from scanner.universe import UniverseScreener
+            screener = UniverseScreener()
+            symbols = screener.get_universe()
+            if symbols:
+                # Add any volume-surge discovery candidates
+                extra = screener.get_discovery_candidates()
+                seen = set(symbols)
+                for s in extra:
+                    if s not in seen:
+                        symbols.append(s)
+                        seen.add(s)
+                return symbols
+        except Exception as e:
+            logger.warning(f"Universe screener error: {e} — using static list")
+
+        return [
+            "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA",
+            "CRM", "NOW", "SNOW", "DDOG", "CRWD", "NET",
+            "KO", "JNJ", "PG", "V", "MA", "BRK-B",
+        ]
+
+    # ─────────────────────────────────────────────
+    # PER-SYMBOL SCAN
+    # ─────────────────────────────────────────────
 
     def _scan_symbol(
         self,
@@ -124,15 +159,19 @@ class WeeklyScanner:
         max_positions_reached: bool,
     ) -> Optional[ScanResult]:
 
-        # 1. Trend analysis
+        # 1. Trend analysis (monthly + weekly)
         trend = self.market.analyze(symbol)
+        if not trend:
+            logger.debug(f"{symbol}: no trend data")
+            return None
 
         # 2. Fundamentals
         fund = self.fundamentals.get(symbol)
         if not fund:
+            logger.debug(f"{symbol}: no fundamentals data")
             return None
 
-        # 3. Options analysis
+        # 3. Options analysis (put/call ratio + strike selection)
         opts = self.options.analyze(
             symbol=symbol,
             current_price=trend.current_price,
@@ -140,7 +179,7 @@ class WeeklyScanner:
             portfolio_value=portfolio_value,
         )
 
-        # 4. Hard rules check
+        # 4. Hard rules gate
         rules_result = self.rules.check(
             symbol=symbol,
             monthly_trend=trend.monthly_trend,
@@ -153,7 +192,7 @@ class WeeklyScanner:
             max_positions_reached=max_positions_reached,
         )
 
-        # 5. Score (even if rules failed — for transparency in report)
+        # 5. Score (even failures get scored — shows up in watchlist)
         score_result = self.scorer.score(
             symbol=symbol,
             monthly_trend_strength=trend.monthly_trend_strength,
@@ -168,7 +207,7 @@ class WeeklyScanner:
             volume_trend_score=trend.volume_trend_score,
         )
 
-        # Estimated total cost
+        # 6. Estimated total cost
         estimated_cost = None
         if opts and opts.estimated_premium and opts.contracts_affordable:
             estimated_cost = opts.estimated_premium * 100 * opts.contracts_affordable
@@ -194,6 +233,10 @@ class WeeklyScanner:
             company_brief=fund.brief,
         )
 
+    # ─────────────────────────────────────────────
+    # REPORT
+    # ─────────────────────────────────────────────
+
     def _print_report(
         self,
         results: list[ScanResult],
@@ -201,7 +244,6 @@ class WeeklyScanner:
         portfolio_value: float,
         open_positions: list,
     ):
-        """Prints the weekly report for Hayes and team to review."""
         now = datetime.now().strftime("%A %B %d, %Y %I:%M %p")
         approved = [r for r in results if r.approved]
         watchlist = [r for r in results if not r.approved]
@@ -222,18 +264,14 @@ class WeeklyScanner:
             print("  " + "-" * 60)
             for r in approved:
                 cost_str = f"~${r.estimated_cost:,.0f}" if r.estimated_cost else "unknown cost"
-                print(
-                    f"\n  {r.symbol} [{r.stock_type.upper()}]  "
-                    f"Score: {r.score:.0%}"
-                )
+                print(f"\n  {r.symbol} [{r.stock_type.upper()}]  Score: {r.score:.0%}")
                 print(f"  {r.company_brief}")
-                print(
-                    f"  Strike: {r.strike_type} ${r.recommended_strike:.2f} "
-                    f"({r.otm_pct:.1f}% OTM)  |  Expiry: {r.recommended_expiry}"
-                )
-                print(
-                    f"  Contracts: {r.contracts}  |  Est. Cost: {cost_str}"
-                )
+                if r.recommended_strike and r.recommended_expiry:
+                    print(
+                        f"  Strike: {r.strike_type} ${r.recommended_strike:.2f} "
+                        f"({r.otm_pct:.1f}% OTM)  |  Expiry: {r.recommended_expiry}"
+                    )
+                    print(f"  Contracts: {r.contracts}  |  Est. Cost: {cost_str}")
                 print(
                     f"  Put/Call: {r.put_call_ratio:.1f}x ({r.put_call_sentiment})  |  "
                     f"Volume: {r.volume_trend}  |  "
@@ -241,12 +279,12 @@ class WeeklyScanner:
                 )
 
         if watchlist:
-            print(f"\n\n  👀 WATCHLIST — Conditions Not Yet Met ({len(watchlist)} names)")
+            print(f"\n\n  👀 WATCHLIST — Not Yet Meeting Conditions ({len(watchlist)} names)")
             print("  " + "-" * 60)
-            for r in watchlist[:5]:    # Show top 5 near-misses only
+            for r in watchlist[:8]:  # Top 8 near-misses
                 print(
                     f"  {r.symbol:6s}  Score: {r.score:.0%}  "
-                    f"Failed: {', '.join(r.failed_rules[:2])}"
+                    f"Failed: {', '.join(r.failed_rules[:2]) or 'score below 60%'}"
                 )
 
         print("\n" + "=" * 65)

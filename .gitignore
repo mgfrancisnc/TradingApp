@@ -1,1 +1,27 @@
+# macOS
 .DS_Store
+
+# Environment / secrets — never commit
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Bot runtime data
+data/*.json
+data/*.csv
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
