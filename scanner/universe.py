@@ -1,15 +1,18 @@
 """
 universe.py
-Discovers stock candidates using tradingview-screener.
-Replaces the static DEFAULT_UNIVERSE list in weekly_scanner.py.
+Large-cap stock universe for the Francis-Hayes Trading Bot.
 
+Screens for stocks that meet the covered call universe criteria from philosophy.yaml:
+  - Market cap ≥ $10B (large-cap only — no small caps)
+  - Average daily volume ≥ 1M shares (deep liquidity)
+  - NYSE or NASDAQ only
+  - Common stocks only (no ETFs, ADRs, or preferred shares)
+
+The screener returns a broad candidate list. The philosophy scorer narrows it down.
+Falls back to a curated S&P 100 + mega-cap static list if the screener is unavailable.
+
+No API key required — uses TradingView's public screener endpoint.
 Install: pip install tradingview-screener
-
-This solves Hayes' use case: 'advice on stocks we may not be watching.'
-Instead of a fixed list, we screen the entire market for names that
-match the broad conditions of his philosophy, then score them properly.
-
-No API key needed — uses TradingView's public screener endpoint.
 """
 
 import logging
@@ -18,14 +21,31 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Fallback list if screener fails or is unavailable
+# S&P 100 + select mega-caps + major sector leaders
+# Used when tradingview-screener is unavailable
 FALLBACK_UNIVERSE = [
-    # Large cap growth
-    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META",
-    # Quality growth
-    "CRM", "NOW", "CRWD", "NET", "DDOG",
-    # Income / dividend growth
-    "KO", "JNJ", "PG", "V", "MA",
+    # Mega-cap tech
+    "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "AMZN", "META",
+    # Large-cap tech
+    "AVGO", "ORCL", "CRM", "ADBE", "AMD", "INTC", "QCOM",
+    # Financials
+    "BRK-B", "JPM", "BAC", "WFC", "GS", "MS", "AXP", "BLK",
+    # Healthcare
+    "JNJ", "UNH", "LLY", "ABBV", "MRK", "PFE", "TMO", "ABT",
+    # Consumer staples (income)
+    "PG", "KO", "PEP", "WMT", "COST", "MCD", "PM",
+    # Industrials
+    "CAT", "HON", "UPS", "RTX", "BA", "GE", "MMM",
+    # Energy
+    "XOM", "CVX", "COP",
+    # Utilities (income)
+    "NEE", "DUK", "SO",
+    # Telecom (income)
+    "VZ", "T",
+    # Payment networks
+    "V", "MA",
+    # Real estate (income)
+    "AMT", "PLD",
 ]
 
 
@@ -39,36 +59,28 @@ class ScreenerResult:
     beta_1_year: Optional[float]
     revenue_growth_yoy: Optional[float]
     dividend_yield: Optional[float]
-    recommendation: Optional[str]   # TradingView's own signal: BUY/SELL/NEUTRAL
 
 
 class UniverseScreener:
     """
-    Uses tradingview-screener to find stocks matching Hayes' broad criteria.
-    Runs at the start of each weekly scan to build a fresh candidate list.
-
-    Screens for:
-    - US equities only (NYSE + NASDAQ)
-    - Market cap > $2B (liquid enough for options)
-    - Volume > 500K average (options liquidity)
-    - Beta between 0.5 and 3.0 (not too dull, not too wild)
-    - Excludes ETFs, funds, and ADRs
+    Builds the weekly candidate list using TradingView's public screener.
+    Filters strictly to large-cap, liquid, NYSE/NASDAQ common stocks.
     """
 
-    MIN_MARKET_CAP = 2_000_000_000     # $2B minimum
-    MIN_AVG_VOLUME = 500_000           # 500K avg daily volume
-    MAX_RESULTS = 100                  # Screen top 100, scorer narrows it down
+    MIN_MARKET_CAP = 10_000_000_000    # $10B — large-cap only
+    MIN_AVG_VOLUME = 1_000_000          # 1M shares/day avg
+    MAX_RESULTS = 150                   # Screen up to 150 names
 
     def get_universe(self) -> list[str]:
         """
-        Returns a list of ticker symbols to scan.
+        Returns ticker symbols to scan this week.
         Falls back to static list if screener unavailable.
         """
         try:
             from tradingview_screener import Query
             symbols = self._run_screen()
             if symbols:
-                logger.info(f"TradingView screener returned {len(symbols)} candidates")
+                logger.info(f"TradingView screener returned {len(symbols)} large-cap candidates")
                 return symbols
         except ImportError:
             logger.warning(
@@ -79,49 +91,8 @@ class UniverseScreener:
         except Exception as e:
             logger.warning(f"Screener error: {e} — falling back to static universe")
 
-        logger.info(f"Using fallback universe of {len(FALLBACK_UNIVERSE)} symbols")
+        logger.info(f"Using fallback universe ({len(FALLBACK_UNIVERSE)} symbols)")
         return FALLBACK_UNIVERSE
-
-    def get_discovery_candidates(self) -> list[str]:
-        """
-        Runs a more aggressive screen specifically to surface names
-        Hayes may not be watching — strong momentum + volume surge.
-        Returns up to 30 additional candidates beyond the base screen.
-        """
-        try:
-            from tradingview_screener import Query, col
-            _, df = (
-                Query()
-                .select(
-                    "name",
-                    "close",
-                    "volume",
-                    "market_cap_basic",
-                    "sector",
-                    "beta_1_year",
-                    "relative_volume_10d_calc",  # Volume vs 10-day avg
-                )
-                .where(
-                    col("market_cap_basic") > self.MIN_MARKET_CAP,
-                    col("average_volume_10d_calc") > self.MIN_AVG_VOLUME,
-                    col("relative_volume_10d_calc") > 1.5,     # Volume surging
-                    col("beta_1_year").between(0.5, 3.0),
-                    col("type") == "stock",
-                    col("subtype") == "common",                # No ETFs/ADRs
-                    col("exchange").isin(["NYSE", "NASDAQ"]),
-                )
-                .order_by("relative_volume_10d_calc", ascending=False)
-                .limit(30)
-                .get_scanner_data()
-            )
-            symbols = df["name"].tolist() if df is not None and not df.empty else []
-            if symbols:
-                logger.info(f"Discovery screen found {len(symbols)} volume-surge candidates")
-            return symbols
-
-        except Exception as e:
-            logger.warning(f"Discovery screen failed: {e}")
-            return []
 
     # ─────────────────────────────────────────────
     # INTERNAL
@@ -129,70 +100,40 @@ class UniverseScreener:
 
     def _run_screen(self) -> list[str]:
         """
-        Base screen: liquid US stocks with options-friendly characteristics.
-        Broad enough to catch everything — the philosophy scorer narrows it down.
+        Large-cap screen — broad enough to catch the full opportunity set,
+        tight enough to stay within Hayes' 'familiar company' universe.
         """
         from tradingview_screener import Query, col
 
-        # ── Growth screen ─────────────────────────
-        # High CAGR, momentum, volume confirmation
-        _, growth_df = (
+        _, df = (
             Query()
             .select(
-                "name", "close", "volume", "market_cap_basic",
-                "sector", "beta_1_year",
-                "revenue_per_employee",         # Proxy for efficiency
+                "name",
+                "close",
+                "volume",
+                "market_cap_basic",
+                "sector",
+                "beta_1_year",
+                "dividends_yield_current",
+                "revenue_per_employee",
                 "earnings_per_share_diluted_ttm",
-                "dividends_yield_current",
-                "Recommend.All",                # TradingView composite signal
-            )
-            .where(
-                col("market_cap_basic") > self.MIN_MARKET_CAP,
-                col("average_volume_10d_calc") > self.MIN_AVG_VOLUME,
-                col("beta_1_year").between(0.8, 3.0),   # Growth needs some beta
-                col("earnings_per_share_diluted_ttm") > 0,  # Profitable
-                col("type") == "stock",
-                col("subtype") == "common",
-                col("exchange").isin(["NYSE", "NASDAQ"]),
-            )
-            .order_by("market_cap_basic", ascending=False)
-            .limit(60)
-            .get_scanner_data()
-        )
-
-        # ── Income screen ─────────────────────────
-        # Dividend payers with yield above ~2%
-        _, income_df = (
-            Query()
-            .select(
-                "name", "close", "volume", "market_cap_basic",
-                "sector", "beta_1_year",
-                "dividends_yield_current",
                 "Recommend.All",
             )
             .where(
                 col("market_cap_basic") > self.MIN_MARKET_CAP,
                 col("average_volume_10d_calc") > self.MIN_AVG_VOLUME,
-                col("dividends_yield_current") > 2.0,   # >2% yield
-                col("beta_1_year") < 1.5,               # Income = lower beta
                 col("type") == "stock",
                 col("subtype") == "common",
                 col("exchange").isin(["NYSE", "NASDAQ"]),
             )
-            .order_by("dividends_yield_current", ascending=False)
-            .limit(40)
+            .order_by("market_cap_basic", ascending=False)
+            .limit(self.MAX_RESULTS)
             .get_scanner_data()
         )
 
-        # Combine and deduplicate
-        symbols = []
-        seen = set()
+        if df is None or df.empty:
+            return []
 
-        for df in [growth_df, income_df]:
-            if df is not None and not df.empty:
-                for sym in df["name"].tolist():
-                    if sym not in seen:
-                        symbols.append(sym)
-                        seen.add(sym)
-
-        return symbols[:self.MAX_RESULTS]
+        symbols = df["name"].tolist()
+        logger.debug(f"Screen returned {len(symbols)} symbols (top by market cap)")
+        return symbols

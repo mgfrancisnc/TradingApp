@@ -1,83 +1,98 @@
 # Francis-Hayes Trading Bot — Claude Code Context
 
 ## What This Project Is
-A monthly call options buying bot built on Alpaca Markets API.
-Encodes the trading philosophy of Hayes, a professional trader.
-Weekly execution cadence — human reviews scan report before any trade fires.
+A covered call writing bot built on Alpaca Markets API (Python).
+Encodes Hayes' trading philosophy into systematic rules.
+Weekly human-in-the-loop workflow — no trade fires without explicit approval.
 
-## Philosophy Source of Truth
-`config/philosophy.yaml` is the single source of truth for all trading rules.
-Never hardcode rule values in Python files — always read from the YAML.
+## Strategy (v3.0 — Assignment-Targeting Covered Calls)
+Sell ATM calls (0.45-0.55 delta) on large-cap stocks we own, 28-35 DTE.
+Hold all positions to expiration. Accept assignment as the intended outcome.
+No early closes. No rolls. Assignment = success, not failure.
 
-## Hayes' Core Rules (never violate these in code)
-- Monthly chart dictates direction — weekly confirms, daily is ignored
-- Max 10% OTM on calls / ATM when S&P monthly trend is down
-- Target expiry: 28–35 DTE
-- Stop loss: exit call if UNDERLYING STOCK drops 10% from entry price
-  (watch stock price, NOT option premium)
-- Max position size: 5% of portfolio per name
-- Max positions: 20 names hard cap
-- Put/call sentiment: look 6–12 months out only (never daily)
-- Best execution windows: Friday PM and Monday AM
+## Single Source of Truth
+`config/philosophy.yaml` — all rule values live here. Never hardcode in Python.
+
+## Hard Rules (binary gates — any failure = trade rejected)
+1. Monthly trend must be bullish
+2. Weekly must confirm monthly
+3. Not breaking support
+4. Revenue positive or stable (not decelerating >50% YoY)
+5. Put/call sentiment not bearish (6-12mo window)
+6. Portfolio below 20-position cap
+7. Stock must be familiar to the team
+8. Must own ≥100 shares before writing a call (`risk/position_check.py`)
+9. IV rank > 30 (only sell premium when IV is elevated)
+10. Options liquidity gates pass (volume ≥1000, OI ≥500, spread ≤5%)
+11. No earnings event within the option's expiry window
 
 ## Project Structure
 ```
 trading_bot/
-├── bot.py                     # Main entry point
-├── CLAUDE.md                  # This file
+├── bot.py                        # Main entry point
+├── CLAUDE.md                     # This file
 ├── requirements.txt
 ├── config/
-│   └── philosophy.yaml        # ALL rule values live here
+│   └── philosophy.yaml           # ALL rule values — single source of truth
 ├── data/
-│   ├── market_data.py         # Price, volume, trend (monthly/weekly only)
-│   └── options_chain.py       # Chain analysis, strike selection, put/call ratio
+│   ├── market_data.py            # Price, volume, trend (monthly/weekly only — daily ignored)
+│   ├── options_chain.py          # Delta-based strike selection, IV rank, liquidity gates
+│   └── fundamentals.py           # Revenue, beta, dividend (yfinance)
 ├── philosophy/
-│   └── scorer.py              # HardRules (binary gates) + PhilosophyScorer
+│   └── scorer.py                 # HardRules (11 binary gates) + PhilosophyScorer (10 factors)
 ├── risk/
-│   └── exit_monitor.py        # 10% stop loss watcher on underlying
+│   ├── exit_monitor.py           # DTE tracking, ITM alerts, assignment logging, circuit breaker
+│   └── position_check.py         # Verify ≥100 shares owned before writing a call
 ├── execution/
-│   └── alpaca_client.py       # Alpaca API wrapper (paper/live toggle)
+│   ├── alpaca_client.py          # Alpaca API wrapper (paper/live toggle)
+│   ├── execute.py                # Sell-to-open submission with human confirmation
+│   └── scheduler.py              # Automated Sunday scan + market hour monitoring
 └── scanner/
-    ├── universe.py            # TradingView screener — dynamic universe
-    └── weekly_scanner.py      # Sunday/Monday scan + ranked report
+    ├── universe.py               # Large-cap screener (≥$10B, NYSE/NASDAQ)
+    └── weekly_scanner.py         # Two jobs: uncovered lots + new candidates
 ```
 
-## Data Sources (no API keys needed)
-- **yfinance** — revenue CAGR, beta, dividend yield, treasury rate
-- **tradingview-screener** — dynamic universe discovery each week
-- **Alpaca** — price bars, options chain, execution
-
-## What's Not Built Yet (next priorities)
-1. `execution/execute` command in bot.py — submit approved trades after human review
-2. Scheduler — cron for Sunday scan + 15-min monitor during market hours
-3. Alerts — Telegram or email for stop loss triggers
+## Weekly Workflow
+```
+Sunday 6pm ET  →  python bot.py scan      # Finds uncovered lots + new candidates
+Sunday evening →  Francis + Hayes review the printed report
+Monday AM      →  python bot.py execute   # Confirm trades, bot submits sell-to-open
+Mon-Fri 30min  →  python bot.py monitor   # DTE tracking, ITM alerts, assignment logging
+```
 
 ## Running the Bot
 ```bash
-# Always paper mode first
-export ALPACA_PAPER=true
+export ALPACA_PAPER=true   # Always paper mode first
 
-python bot.py scan      # Weekly scan — no trades, report only
-python bot.py monitor   # Check stop losses (run every 15 min during hours)
-python bot.py status    # Portfolio overview
+python bot.py scan         # Weekly scan — no trades, report only
+python bot.py execute      # Review approved trades, confirm, submit
+python bot.py monitor      # Check DTE and assignments (run every 30min)
+python bot.py schedule     # Run continuous scheduler
+python bot.py status       # Portfolio overview
 ```
+
+## Data Sources (no paid API keys beyond Alpaca)
+- **Alpaca** — price bars, options chain (delta, IV, OI), order execution
+- **yfinance** — revenue, beta, dividend yield, 10yr treasury rate
+- **tradingview-screener** — large-cap universe discovery
 
 ## Key Design Decisions
 - All Alpaca interactions go through `execution/alpaca_client.py` only
-- Hard rules are binary gates — if any fail, no score is computed
-- Scorer produces 0.0–1.0; trades need >= 0.60 to be approved
-- Open positions persisted to `data/open_positions.json`
-- Paper/live toggle is env var `ALPACA_PAPER=true/false` — never hardcode
-
-## When Adding New Strategies
-The monthly call strategy is Strategy #1. Future strategies (spreads, iron
-condors, etc.) should be added as new modules under `execution/` with their
-own strategy_selector logic. The scanner and scorer are strategy-agnostic.
+- Hard rules are binary gates — any failure skips scoring entirely
+- Scorer produces 0.0-1.0; threshold is 0.60 (from philosophy.yaml)
+- Positions persisted to `data/open_positions.json`
+- Approved trades saved to `data/approved_trades.json` between scan and execute
+- Paper/live toggle: env var `ALPACA_PAPER=true/false` — never hardcode
 
 ## Coding Conventions
 - Python 3.11+
 - Dataclasses for structured return types
 - All monetary values as float in USD
 - Dates as strings "YYYY-MM-DD" unless doing date math
-- Log with `logging` module — never bare `print()` except in report output
-- Every public method needs a docstring explaining the Hayes rule it encodes
+- Log with `logging` module — bare `print()` only for report output
+- Read all rule values from `philosophy.yaml` — never hardcode thresholds
+
+## When Adding Strategy #2
+The covered call strategy is Strategy #1. Future strategies (cash-secured puts,
+wheel) should add new scorer logic and philosophy.yaml sections without modifying
+Strategy #1 code. The data layer and execution layer are shared.

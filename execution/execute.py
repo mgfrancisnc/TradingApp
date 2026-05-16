@@ -1,14 +1,14 @@
 """
 execute.py
-Submits approved trades from the weekly scan report.
-Always requires human approval before any order is placed.
+Submits approved covered call trades from the weekly scan report.
+Always requires human confirmation before any order is placed.
 
 Workflow:
-  1. Run: python bot.py scan        → generates approved list
+  1. python bot.py scan      → finds uncovered lots + new candidates, saves approved list
   2. Review the report with Hayes
-  3. Run: python bot.py execute     → shows approved trades, asks confirmation
-  4. Approve each trade individually or all at once
-  5. Bot submits orders to Alpaca and tracks positions
+  3. python bot.py execute   → shows approved trades, asks for confirmation
+  4. Confirm each trade individually or all at once
+  5. Bot submits sell-to-open orders to Alpaca and registers positions for monitoring
 
 Hayes: 'If you're not familiar with the company — don't touch it.'
 Human approval is mandatory. This bot never trades without review.
@@ -22,6 +22,7 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 
 from risk.exit_monitor import OpenPosition, ExitMonitor
+from risk.position_check import PositionChecker
 
 logger = logging.getLogger(__name__)
 
@@ -35,38 +36,41 @@ class ApprovedTrade:
     stock_type: str
     recommended_strike: float
     recommended_expiry: str
-    strike_type: str
-    otm_pct: float
-    contracts: int
-    estimated_cost: float
+    delta: float                    # Delta of selected strike (~0.50)
+    contracts_to_write: int         # shares_owned // 100
+    premium_per_share: float        # Premium collected per share
+    premium_total: float            # premium_per_share × 100 × contracts
     current_stock_price: float
+    iv_rank: Optional[float]
+    shares_owned: int
+    scan_type: str                  # "uncovered_lot" or "new_candidate"
     brief: str
     approved_at: str = ""
 
 
 class TradeExecutor:
     """
-    Handles the execute command — presents approved trades for
-    final human confirmation then submits to Alpaca.
+    Handles the execute command — presents approved covered call trades for
+    human confirmation then submits sell-to-open orders to Alpaca.
     """
 
     def __init__(self, alpaca_client, philosophy: dict):
         self.client = alpaca_client
         self.phil = philosophy
-        self.exit_monitor = ExitMonitor(alpaca_client)
+        self.exit_monitor = ExitMonitor(alpaca_client, philosophy)
+        self.position_checker = PositionChecker(alpaca_client)
 
     def run(self, scan_results: list = None):
         """
-        Main execute flow.
-        If scan_results passed in, uses those.
-        Otherwise loads last saved approved trades from disk.
+        Main execute flow. Loads approved trades from scan or disk,
+        presents them for confirmation, then submits to Alpaca.
         """
         if not self.client.is_market_open():
-            print("\n⚠️  Market is currently closed.")
-            print("Orders can only be submitted during market hours (9:30am–4pm ET).")
-            print("You can still review and pre-approve trades — they'll execute at open.\n")
+            print("\n  Market is currently closed.")
+            print("  Orders can only be submitted during market hours (9:30am-4pm ET).")
+            print("  You can review trades now — submit when market opens.\n")
 
-        # Load trades to review
+        # Load trades
         if scan_results:
             approved = [r for r in scan_results if r.approved]
             trades = self._scan_results_to_trades(approved)
@@ -83,89 +87,86 @@ class TradeExecutor:
         remaining_slots = self.phil["risk"]["max_positions"] - len(open_positions)
 
         if remaining_slots <= 0:
-            print(f"\n  ⛔ Portfolio is at the 20 position limit. No new trades possible.\n")
+            print(f"\n  Portfolio is at the {self.phil['risk']['max_positions']}-position limit. No new trades possible.\n")
             return
 
         if len(trades) > remaining_slots:
-            print(f"\n  ⚠️  {len(trades)} trades approved but only {remaining_slots} slots available.")
+            print(f"\n  {len(trades)} trades approved but only {remaining_slots} slot(s) available.")
             print(f"  Showing top {remaining_slots} by score.\n")
             trades = trades[:remaining_slots]
 
-        # Present trades for review
         self._print_trade_review(trades, open_positions)
-
-        # Get confirmation
         confirmed = self._get_confirmation(trades)
 
         if not confirmed:
             print("\n  No trades submitted. Run again when ready.\n")
             return
 
-        # Execute
         self._execute_trades(confirmed)
 
     # ─────────────────────────────────────────────
-    # TRADE REVIEW DISPLAY
+    # DISPLAY
     # ─────────────────────────────────────────────
 
     def _print_trade_review(self, trades: list[ApprovedTrade], open_positions: list):
         portfolio_value = self.client.get_portfolio_value()
-        total_cost = sum(t.estimated_cost for t in trades if t.estimated_cost)
+        total_income = sum(t.premium_total for t in trades)
 
         print("\n" + "=" * 65)
-        print("  FRANCIS-HAYES TRADING BOT — TRADE EXECUTION REVIEW")
+        print("  FRANCIS-HAYES TRADING BOT — COVERED CALL EXECUTION REVIEW")
         print("  " + datetime.now().strftime("%A %B %d, %Y %I:%M %p"))
         print("=" * 65)
-        print(f"  Portfolio Value:   ${portfolio_value:,.2f}")
-        print(f"  Open Positions:    {len(open_positions)} / 20")
-        print(f"  Trades to Review:  {len(trades)}")
-        print(f"  Total Est. Cost:   ${total_cost:,.2f}  ({total_cost/portfolio_value:.1%} of portfolio)")
+        print(f"  Portfolio Value:      ${portfolio_value:,.2f}")
+        print(f"  Open Positions:       {len(open_positions)} / {self.phil['risk']['max_positions']}")
+        print(f"  Trades to Review:     {len(trades)}")
+        print(f"  Total Premium Income: ${total_income:,.2f}")
         print("=" * 65)
 
         for i, trade in enumerate(trades, 1):
-            stop_price = trade.current_stock_price * 0.90
-            print(f"\n  [{i}] {trade.symbol}  —  Score: {trade.score:.0%}  [{trade.stock_type.upper()}]")
+            tag = "[UNCOVERED LOT]" if trade.scan_type == "uncovered_lot" else "[BUY-WRITE]"
+            print(f"\n  [{i}] {trade.symbol}  {tag}  Score: {trade.score:.0%}  [{trade.stock_type.upper()}]")
             print(f"      {trade.brief}")
-            print(f"      Strike:   {trade.strike_type} ${trade.recommended_strike:.2f} ({trade.otm_pct:.1f}% OTM)")
-            print(f"      Expiry:   {trade.recommended_expiry}  |  Contracts: {trade.contracts}")
-            print(f"      Est Cost: ${trade.estimated_cost:,.2f}  ({trade.estimated_cost/portfolio_value:.1%} of portfolio)")
-            print(f"      Stop Loss: Stock drops to ${stop_price:.2f} (10% below ${trade.current_stock_price:.2f})")
+            print(f"      Shares owned:  {trade.shares_owned}")
+            print(f"      Strike:        ${trade.recommended_strike:.2f}  (delta {trade.delta:.2f})")
+            print(f"      Expiry:        {trade.recommended_expiry}  |  Contracts: {trade.contracts_to_write}")
+            print(f"      IV Rank:       {trade.iv_rank:.0f}" if trade.iv_rank else "      IV Rank:       N/A")
+            print(f"      Premium:       ${trade.premium_per_share:.2f}/share  =  ${trade.premium_total:,.2f} total income")
 
         print("\n" + "=" * 65)
+        print("  Strategy: hold to expiration. Assignment = success.")
+        print("  No stop losses. No early closes. No rolls.")
+        print("=" * 65)
 
     # ─────────────────────────────────────────────
     # CONFIRMATION
     # ─────────────────────────────────────────────
 
     def _get_confirmation(self, trades: list[ApprovedTrade]) -> list[ApprovedTrade]:
-        """
-        Interactive confirmation. Approve all, individual, or none.
-        Returns list of confirmed trades.
-        """
         print("\n  Options:")
         print("  [A] Approve ALL trades")
-        print("  [1-9] Approve individual trade by number")
+        print("  [1,2,...] Approve individual trades by number (comma-separated)")
         print("  [N] Cancel — submit nothing")
         print()
 
         choice = input("  Your choice: ").strip().upper()
 
-        if choice == "N" or choice == "":
+        if choice in ("N", ""):
             return []
 
         if choice == "A":
             confirm = input(f"\n  Confirm ALL {len(trades)} trades? (yes/no): ").strip().lower()
             return trades if confirm == "yes" else []
 
-        # Individual selection
         confirmed = []
         try:
             indices = [int(x.strip()) - 1 for x in choice.split(",")]
             for i in indices:
                 if 0 <= i < len(trades):
                     confirm = input(
-                        f"\n  Confirm {trades[i].symbol} "
-                        f"${trades[i].estimated_cost:,.2f}? (yes/no): "
+                        f"\n  Confirm {trades[i].symbol} — "
+                        f"sell {trades[i].contracts_to_write} call(s) @ "
+                        f"${trades[i].premium_per_share:.2f}/share "
+                        f"(${trades[i].premium_total:,.2f} income)? (yes/no): "
                     ).strip().lower()
                     if confirm == "yes":
                         confirmed.append(trades[i])
@@ -180,7 +181,6 @@ class TradeExecutor:
     # ─────────────────────────────────────────────
 
     def _execute_trades(self, trades: list[ApprovedTrade]):
-        """Submits orders to Alpaca and registers stop loss tracking."""
         print()
         succeeded = []
         failed = []
@@ -189,57 +189,61 @@ class TradeExecutor:
             try:
                 print(f"  Submitting {trade.symbol}...", end=" ")
 
-                # Get current mid price for limit order
-                chain = self.client.get_options_chain(
-                    trade.symbol, dte_min=25, dte_max=38
-                )
-                limit_price = self._get_mid_price(chain, trade.recommended_strike)
-
-                if not limit_price:
-                    print("❌ Could not get limit price — skipped")
+                # Verify shares still owned before submitting
+                status = self.position_checker.check(trade.symbol)
+                if not status.eligible_to_write:
+                    reason = "already has open call" if status.has_open_call else f"only {status.shares_owned} shares owned"
+                    print(f"  Skipping — {reason}")
                     failed.append(trade.symbol)
                     continue
 
-                # Submit the order
-                order = self.client.buy_call(
+                # Get fresh mid price for limit order
+                chain = self.client.get_options_chain(trade.symbol, dte_min=25, dte_max=38)
+                limit_price = self._get_mid_price(chain, trade.recommended_strike)
+
+                if not limit_price:
+                    print("  Could not get limit price — skipped")
+                    failed.append(trade.symbol)
+                    continue
+
+                # Submit sell-to-open order
+                order = self.client.sell_call(
                     symbol=trade.symbol,
                     expiry=trade.recommended_expiry,
                     strike=trade.recommended_strike,
-                    contracts=trade.contracts,
+                    contracts=trade.contracts_to_write,
                     order_type="limit",
                     limit_price=round(limit_price, 2),
                 )
 
-                # Register with exit monitor for stop loss tracking
-                stop_price = round(trade.current_stock_price * 0.90, 2)
+                # Register with exit monitor for DTE tracking
                 position = OpenPosition(
                     symbol=trade.symbol,
                     option_symbol=order.symbol,
-                    entry_stock_price=trade.current_stock_price,
-                    stop_loss_price=stop_price,
-                    entry_date=datetime.now().strftime("%Y-%m-%d"),
-                    expiry=trade.recommended_expiry,
                     strike=trade.recommended_strike,
-                    contracts=trade.contracts,
+                    expiry=trade.recommended_expiry,
+                    contracts=trade.contracts_to_write,
                     entry_premium=limit_price,
+                    entry_date=datetime.now().strftime("%Y-%m-%d"),
+                    entry_stock_price=trade.current_stock_price,
                 )
                 self.exit_monitor.add_position(position)
 
-                print(f"✅ Order submitted @ ${limit_price:.2f} limit")
+                print(f"  Order submitted — sell {trade.contracts_to_write} call(s) @ ${limit_price:.2f} limit")
                 succeeded.append(trade.symbol)
 
             except Exception as e:
-                print(f"❌ Failed: {e}")
+                print(f"  Failed: {e}")
+                logger.error(f"{trade.symbol}: execution failed — {e}")
                 failed.append(trade.symbol)
 
-        # Summary
         print("\n" + "=" * 65)
         if succeeded:
-            print(f"  ✅ Submitted: {', '.join(succeeded)}")
+            print(f"  Submitted: {', '.join(succeeded)}")
         if failed:
-            print(f"  ❌ Failed:    {', '.join(failed)}")
-        print(f"\n  Stop losses registered at 10% below entry stock price.")
-        print(f"  Run 'python bot.py monitor' during market hours to watch positions.")
+            print(f"  Failed:    {', '.join(failed)}")
+        print(f"\n  Positions registered for DTE monitoring.")
+        print(f"  Run 'python bot.py monitor' during market hours to track positions.")
         print("=" * 65 + "\n")
 
     # ─────────────────────────────────────────────
@@ -247,7 +251,6 @@ class TradeExecutor:
     # ─────────────────────────────────────────────
 
     def _get_mid_price(self, chain, strike: float) -> Optional[float]:
-        """Gets mid of bid/ask for limit order pricing."""
         try:
             match = next(
                 (c for c in chain
@@ -261,10 +264,9 @@ class TradeExecutor:
             return None
 
     def _scan_results_to_trades(self, results) -> list[ApprovedTrade]:
-        """Converts scan results to ApprovedTrade objects."""
         trades = []
         for r in results:
-            if not r.recommended_strike or not r.estimated_cost:
+            if not r.recommended_strike or not r.premium_per_share:
                 continue
             trades.append(ApprovedTrade(
                 symbol=r.symbol,
@@ -272,20 +274,21 @@ class TradeExecutor:
                 stock_type=r.stock_type,
                 recommended_strike=r.recommended_strike,
                 recommended_expiry=r.recommended_expiry,
-                strike_type=r.strike_type or "OTM",
-                otm_pct=r.otm_pct or 0.0,
-                contracts=r.contracts or 1,
-                estimated_cost=r.estimated_cost,
-                current_stock_price=0.0,    # Fetched fresh at execution
+                delta=r.delta or 0.50,
+                contracts_to_write=r.contracts_to_write or 1,
+                premium_per_share=r.premium_per_share,
+                premium_total=r.premium_total or 0.0,
+                current_stock_price=r.current_stock_price,
+                iv_rank=r.iv_rank,
+                shares_owned=r.shares_owned,
+                scan_type=r.scan_type,
                 brief=r.company_brief,
                 approved_at=datetime.now().isoformat(),
             ))
-        # Sort by score
-        trades.sort(key=lambda t: -t.score)
+        trades.sort(key=lambda t: (-int(t.scan_type == "uncovered_lot"), -t.score))
         return trades
 
     def _load_saved_trades(self) -> list[ApprovedTrade]:
-        """Loads previously saved approved trades from disk."""
         if not os.path.exists(APPROVED_TRADES_FILE):
             return []
         try:
@@ -297,7 +300,6 @@ class TradeExecutor:
             return []
 
     def save_approved_trades(self, trades: list[ApprovedTrade]):
-        """Saves approved trades to disk for execution later."""
         os.makedirs(os.path.dirname(APPROVED_TRADES_FILE), exist_ok=True)
         with open(APPROVED_TRADES_FILE, "w") as f:
             json.dump([asdict(t) for t in trades], f, indent=2)

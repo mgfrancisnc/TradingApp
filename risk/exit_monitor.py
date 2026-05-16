@@ -1,66 +1,82 @@
 """
 exit_monitor.py
-Stop loss tracking and exit execution for the Francis-Hayes Trading Bot.
+Position tracking and expiration monitoring for the Francis-Hayes Trading Bot.
 
-Hayes' exit rule:
-  'If the STOCK drops 10% from where I bought it, I close the call —
-   regardless of what the option is worth.'
+Assignment-targeting strategy — what we DO and DON'T do:
+  DO:  Track DTE on open covered calls
+  DO:  Alert when approaching expiration (≤7 DTE)
+  DO:  Alert when ITM near expiry (≤3 DTE and stock above strike)
+  DO:  Log assignment events (shares called away, cash returned to pool)
+  DO:  Enforce circuit breaker (halt if portfolio drops ≥3% today)
+  DON'T: Close positions early
+  DON'T: Roll positions
+  DON'T: Watch stop losses — assignment is the goal, not a failure
 
-This module:
-  - Tracks open positions in a JSON file (risk/positions.json)
-  - Checks the underlying stock price against each position's stop loss
-  - Triggers close orders via Alpaca when stop is hit
-  - Issues warnings at 7% loss (early warning) before the 10% hard stop
-
-Stop loss watches the STOCK price, not the option premium.
-This is intentional — Hayes watches the business, not the derivative.
+Alert types:
+  EXPIRING_SOON      — ≤7 DTE, heads-up
+  ITM_WARNING        — stock above strike with ≤3 DTE, assignment likely
+  ASSIGNED           — confirmed assignment detected
+  EXPIRED_WORTHLESS  — expired below strike, keep premium and shares, write next cycle
+  CIRCUIT_BREAKER    — portfolio dropped ≥3% today, halt new trades
 """
 
 import json
 import logging
 import os
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-POSITIONS_FILE = "risk/positions.json"
-WARNING_PCT = 7.0    # Warn at -7% underlying drop
-STOP_LOSS_PCT = 10.0 # Close at -10% underlying drop
+POSITIONS_FILE = "data/open_positions.json"
+EXPIRING_SOON_DTE = 7       # Alert when ≤7 days to expiry
+ITM_WARNING_DTE = 3         # ITM alert triggers only within 3 days of expiry
 
 
 @dataclass
 class OpenPosition:
     symbol: str
-    option_symbol: str          # Full OCC option symbol (used to close the position)
-    entry_stock_price: float    # Stock price when we bought the call
-    stop_loss_price: float      # = entry_stock_price * 0.90
-    entry_date: str             # "YYYY-MM-DD"
-    expiry: str                 # Option expiry "YYYY-MM-DD"
+    option_symbol: str      # Full OCC option symbol
     strike: float
+    expiry: str             # "YYYY-MM-DD"
     contracts: int
-    entry_premium: float        # Per-contract mid price at entry
+    entry_premium: float    # Per-share premium collected at entry
+    entry_date: str         # "YYYY-MM-DD"
+    entry_stock_price: float
+
+    @property
+    def dte(self) -> int:
+        """Days to expiration from today."""
+        expiry_date = datetime.strptime(self.expiry, "%Y-%m-%d").date()
+        return max(0, (expiry_date - date.today()).days)
+
+    @property
+    def total_premium_collected(self) -> float:
+        """Total premium collected for this position (per-share × 100 × contracts)."""
+        return self.entry_premium * 100 * self.contracts
 
 
 @dataclass
-class ExitSignal:
+class MonitorAlert:
     symbol: str
     option_symbol: str
-    action: str         # "CLOSE" or "WARN"
-    reason: str
-    current_stock_price: float
-    loss_pct: float
+    alert_type: str         # EXPIRING_SOON | ITM_WARNING | ASSIGNED | EXPIRED_WORTHLESS | CIRCUIT_BREAKER
+    message: str
+    dte: Optional[int]
+    current_stock_price: Optional[float]
+    strike: Optional[float]
 
 
 class ExitMonitor:
     """
-    Monitors open positions for stop loss triggers.
+    Monitors open covered call positions for expiration and assignment events.
     Positions are persisted to disk so they survive restarts.
     """
 
-    def __init__(self, alpaca_client):
+    def __init__(self, alpaca_client, philosophy: dict):
         self.client = alpaca_client
+        self.phil = philosophy
         self._positions: dict[str, OpenPosition] = {}
         self._load_positions()
 
@@ -69,142 +85,187 @@ class ExitMonitor:
     # ─────────────────────────────────────────────
 
     def add_position(self, position: OpenPosition):
-        """Register a new position for stop loss monitoring."""
+        """Register a newly written covered call for monitoring."""
         self._positions[position.symbol] = position
         self._save_positions()
         logger.info(
-            f"Stop loss registered: {position.symbol} "
-            f"stock entry ${position.entry_stock_price:.2f} "
-            f"stop ${position.stop_loss_price:.2f}"
+            f"Covered call registered: {position.symbol} "
+            f"${position.strike} exp {position.expiry} "
+            f"x{position.contracts} @ ${position.entry_premium:.2f}/share "
+            f"(${position.total_premium_collected:.2f} collected)"
         )
 
     def remove_position(self, symbol: str):
-        """Remove a closed position from tracking."""
+        """Remove a closed or assigned position from tracking."""
         if symbol in self._positions:
             del self._positions[symbol]
             self._save_positions()
             logger.info(f"Position removed from tracking: {symbol}")
 
     def get_positions(self) -> list[OpenPosition]:
-        """Returns all currently tracked positions."""
         return list(self._positions.values())
 
     # ─────────────────────────────────────────────
-    # STOP LOSS CHECKS
+    # MONITORING
     # ─────────────────────────────────────────────
 
-    def check_all(self) -> list[ExitSignal]:
+    def check_all(self) -> list[MonitorAlert]:
         """
-        Checks every tracked position against its stop loss.
-        Returns list of signals (WARN or CLOSE).
-        Called during market hours by the scheduler.
+        Runs all position checks and the circuit breaker.
+        Called every 30 minutes during market hours by the scheduler.
+        Returns list of alerts to display or send as notifications.
         """
+        alerts = []
+
+        # Check circuit breaker first
+        cb_alert = self._check_circuit_breaker()
+        if cb_alert:
+            alerts.append(cb_alert)
+
         if not self._positions:
+            return alerts
+
+        # Check each position
+        for symbol, pos in list(self._positions.items()):
+            position_alerts = self._check_position(pos)
+            alerts.extend(position_alerts)
+
+        return alerts
+
+    def handle_assignments(self) -> list[str]:
+        """
+        Detects and logs positions that have been assigned (shares called away).
+        Returns list of symbols that were assigned.
+        Removes them from tracking and logs cash return to pool.
+        """
+        assigned = []
+        try:
+            open_option_symbols = {
+                getattr(p, "symbol", "") for p in self.client.get_open_option_positions()
+            }
+        except Exception as e:
+            logger.error(f"Could not fetch open option positions: {e}")
             return []
 
-        signals = []
         for symbol, pos in list(self._positions.items()):
-            signal = self._check_position(pos)
-            if signal:
-                signals.append(signal)
+            if pos.option_symbol not in open_option_symbols:
+                # Position is gone — either assigned or expired
+                current_price = self._get_stock_price(symbol)
+                if current_price and current_price >= pos.strike:
+                    action = "ASSIGNED"
+                    msg = (
+                        f"{symbol}: shares assigned at ${pos.strike:.2f}. "
+                        f"Premium collected: ${pos.total_premium_collected:.2f}. "
+                        f"Cash returned to pool."
+                    )
+                else:
+                    action = "EXPIRED_WORTHLESS"
+                    msg = (
+                        f"{symbol}: call expired worthless. "
+                        f"Premium collected: ${pos.total_premium_collected:.2f}. "
+                        f"Shares retained — eligible to write next cycle."
+                    )
+                logger.info(f"{action}: {msg}")
+                self.remove_position(symbol)
+                assigned.append(symbol)
 
-        return signals
-
-    def execute_exits(self, signals: list[ExitSignal]) -> list[str]:
-        """
-        Executes CLOSE orders for triggered stop losses.
-        Returns list of symbols that were closed.
-        """
-        closed = []
-        for signal in signals:
-            if signal.action != "CLOSE":
-                continue
-            try:
-                logger.warning(
-                    f"STOP LOSS: {signal.symbol} stock at ${signal.current_stock_price:.2f} "
-                    f"({signal.loss_pct:.1f}% below entry) — closing {signal.option_symbol}"
-                )
-                self.client.close_position(signal.option_symbol)
-                self.remove_position(signal.symbol)
-                closed.append(signal.symbol)
-            except Exception as e:
-                logger.error(f"Failed to close {signal.symbol}: {e}")
-
-        return closed
+        return assigned
 
     # ─────────────────────────────────────────────
     # INTERNAL CHECKS
     # ─────────────────────────────────────────────
 
-    def _check_position(self, pos: OpenPosition) -> Optional[ExitSignal]:
+    def _check_position(self, pos: OpenPosition) -> list[MonitorAlert]:
+        """Returns any alerts for a single position based on DTE and ITM status."""
+        alerts = []
+        dte = pos.dte
+
+        if dte <= 0:
+            return alerts  # handle_assignments() deals with expired positions
+
+        current_price = self._get_stock_price(pos.symbol)
+
+        # Expiring soon alert
+        if dte <= EXPIRING_SOON_DTE:
+            itm = current_price is not None and current_price >= pos.strike
+            if dte <= ITM_WARNING_DTE and itm:
+                alerts.append(MonitorAlert(
+                    symbol=pos.symbol,
+                    option_symbol=pos.option_symbol,
+                    alert_type="ITM_WARNING",
+                    message=(
+                        f"{pos.symbol}: {dte} DTE, stock ${current_price:.2f} "
+                        f"above strike ${pos.strike:.2f} — assignment likely at expiry"
+                    ),
+                    dte=dte,
+                    current_stock_price=current_price,
+                    strike=pos.strike,
+                ))
+            else:
+                alerts.append(MonitorAlert(
+                    symbol=pos.symbol,
+                    option_symbol=pos.option_symbol,
+                    alert_type="EXPIRING_SOON",
+                    message=(
+                        f"{pos.symbol}: {dte} DTE remaining "
+                        f"(strike ${pos.strike:.2f}, exp {pos.expiry})"
+                        + (f" — OTM at ${current_price:.2f}" if current_price else "")
+                    ),
+                    dte=dte,
+                    current_stock_price=current_price,
+                    strike=pos.strike,
+                ))
+
+        return alerts
+
+    def _check_circuit_breaker(self) -> Optional[MonitorAlert]:
         """
-        Gets current stock price and checks against stop loss.
-        Returns ExitSignal if action is needed, else None.
+        Checks if portfolio has dropped ≥3% today.
+        If so, returns an alert — the scheduler uses this to halt new trades.
         """
         try:
-            current_price = self._get_current_stock_price(pos.symbol)
+            max_loss_pct = self.phil.get("risk", {}).get("max_daily_loss_pct", 3.0)
+            portfolio = self.client.get_portfolio_history_today()
+            if not portfolio:
+                return None
+
+            open_value = portfolio.get("open_value")
+            current_value = portfolio.get("current_value")
+            if not open_value or not current_value or open_value == 0:
+                return None
+
+            drop_pct = (open_value - current_value) / open_value * 100
+            if drop_pct >= max_loss_pct:
+                return MonitorAlert(
+                    symbol="PORTFOLIO",
+                    option_symbol="",
+                    alert_type="CIRCUIT_BREAKER",
+                    message=(
+                        f"CIRCUIT BREAKER: portfolio down {drop_pct:.1f}% today "
+                        f"(threshold {max_loss_pct}%). Halt all new positions."
+                    ),
+                    dte=None,
+                    current_stock_price=current_value,
+                    strike=None,
+                )
         except Exception as e:
-            logger.warning(f"{pos.symbol}: could not fetch price — {e}")
-            return None
-
-        if current_price is None:
-            return None
-
-        loss_pct = (pos.entry_stock_price - current_price) / pos.entry_stock_price * 100
-
-        if loss_pct >= STOP_LOSS_PCT:
-            return ExitSignal(
-                symbol=pos.symbol,
-                option_symbol=pos.option_symbol,
-                action="CLOSE",
-                reason=(
-                    f"{pos.symbol} stock dropped {loss_pct:.1f}% "
-                    f"(${current_price:.2f} vs entry ${pos.entry_stock_price:.2f}) "
-                    f"— 10% stop loss triggered"
-                ),
-                current_stock_price=current_price,
-                loss_pct=loss_pct,
-            )
-
-        if loss_pct >= WARNING_PCT:
-            return ExitSignal(
-                symbol=pos.symbol,
-                option_symbol=pos.option_symbol,
-                action="WARN",
-                reason=(
-                    f"{pos.symbol} stock down {loss_pct:.1f}% "
-                    f"(${current_price:.2f} vs entry ${pos.entry_stock_price:.2f}) "
-                    f"— approaching 10% stop"
-                ),
-                current_stock_price=current_price,
-                loss_pct=loss_pct,
-            )
+            logger.debug(f"Circuit breaker check failed: {e}")
 
         return None
 
-    def _get_current_stock_price(self, symbol: str) -> Optional[float]:
+    def _get_stock_price(self, symbol: str) -> Optional[float]:
         """Fetches current stock price via Alpaca."""
-        price = self.client.get_latest_stock_price(symbol)
-        if price:
-            return price
-
-        # Fall back: check if it's in open positions
         try:
-            positions = self.client.get_open_option_positions()
-            for p in positions:
-                if hasattr(p, "current_price") and p.symbol.startswith(symbol):
-                    return float(p.current_price)
-        except Exception:
-            pass
-
-        return None
+            return self.client.get_latest_stock_price(symbol)
+        except Exception as e:
+            logger.warning(f"{symbol}: could not fetch stock price — {e}")
+            return None
 
     # ─────────────────────────────────────────────
     # PERSISTENCE
     # ─────────────────────────────────────────────
 
     def _save_positions(self):
-        """Persists positions to disk so they survive restarts."""
         try:
             os.makedirs(os.path.dirname(POSITIONS_FILE), exist_ok=True)
             data = {sym: asdict(pos) for sym, pos in self._positions.items()}
@@ -214,7 +275,6 @@ class ExitMonitor:
             logger.error(f"Could not save positions: {e}")
 
     def _load_positions(self):
-        """Loads previously saved positions from disk."""
         if not os.path.exists(POSITIONS_FILE):
             return
         try:
@@ -225,7 +285,7 @@ class ExitMonitor:
                 for sym, pos_data in data.items()
             }
             if self._positions:
-                logger.info(f"Loaded {len(self._positions)} tracked position(s) from disk")
+                logger.info(f"Loaded {len(self._positions)} open position(s) from disk")
         except Exception as e:
             logger.warning(f"Could not load saved positions: {e}")
             self._positions = {}
